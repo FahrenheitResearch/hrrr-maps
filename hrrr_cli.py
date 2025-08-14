@@ -98,46 +98,78 @@ def get_recent_dates():
 
 def select_categories() -> List[str]:
     """Interactive category selection"""
-    choices = [
-        questionary.Choice(emoji_name, value=key)
-        for key, emoji_name in CATEGORIES.items()
-    ]
+    console.print("\n[bold cyan]Available Categories:[/bold cyan]")
     
-    selected = questionary.checkbox(
-        "Select categories to process:",
-        choices=choices,
-        style=questionary.Style([
-            ('question', 'bold'),
-            ('answer', 'fg:#ff9d00 bold'),
-            ('pointer', 'fg:#ff9d00 bold'),
-            ('highlighted', 'fg:#ff9d00 bold'),
-            ('selected', 'fg:#cc5454'),
-            ('separator', 'fg:#cc5454'),
-            ('instruction', ''),
-            ('text', ''),
-            ('disabled', 'fg:#858585 italic')
-        ])
-    ).ask()
+    # Display categories with numbers
+    categories_list = list(CATEGORIES.items())
+    for i, (key, emoji_name) in enumerate(categories_list, 1):
+        console.print(f"  {i:2}. {emoji_name}")
     
-    return selected if selected else []
+    console.print(f"  {len(categories_list)+1:2}. [bold green]All categories[/bold green]")
+    console.print("   0. [bold red]Skip[/bold red]")
+    
+    # Get user selection
+    while True:
+        try:
+            selection = Prompt.ask(
+                "\n[bold]Enter category numbers (comma-separated, e.g., 1,3,5) or 0 to skip[/bold]",
+                default="0"
+            )
+            
+            if selection == "0":
+                return []
+            
+            if selection == str(len(categories_list)+1):
+                return list(CATEGORIES.keys())
+            
+            # Parse comma-separated numbers
+            numbers = [int(x.strip()) for x in selection.split(",")]
+            selected_keys = []
+            
+            for num in numbers:
+                if 1 <= num <= len(categories_list):
+                    selected_keys.append(categories_list[num-1][0])
+                else:
+                    console.print(f"[red]Invalid number: {num}[/red]")
+                    continue
+            
+            if selected_keys:
+                # Show selected categories
+                console.print("\n[bold green]Selected categories:[/bold green]")
+                for key in selected_keys:
+                    console.print(f"  ✓ {CATEGORIES[key]}")
+                return selected_keys
+            else:
+                console.print("[yellow]No valid categories selected. Try again.[/yellow]")
+                
+        except ValueError:
+            console.print("[red]Invalid input. Please enter numbers separated by commas.[/red]")
 
 def select_workflow():
     """Select a predefined workflow"""
-    choices = [
-        questionary.Choice(emoji_name, value=key)
-        for key, emoji_name in WORKFLOWS.items()
-    ]
+    console.print("\n[bold cyan]Available Workflows:[/bold cyan]")
     
-    return questionary.select(
-        "Choose a workflow:",
-        choices=choices,
-        style=questionary.Style([
-            ('question', 'bold'),
-            ('answer', 'fg:#ff9d00 bold'),
-            ('pointer', 'fg:#ff9d00 bold'),
-            ('highlighted', 'fg:#ff9d00 bold'),
-        ])
-    ).ask()
+    workflows_list = list(WORKFLOWS.items())
+    for i, (key, emoji_name) in enumerate(workflows_list, 1):
+        console.print(f"  {i}. {emoji_name}")
+    
+    while True:
+        try:
+            selection = Prompt.ask(
+                f"\n[bold]Choose workflow (1-{len(workflows_list)})[/bold]",
+                default="1"
+            )
+            
+            num = int(selection)
+            if 1 <= num <= len(workflows_list):
+                selected_key = workflows_list[num-1][0]
+                console.print(f"\n[bold green]Selected:[/bold green] {WORKFLOWS[selected_key]}")
+                return selected_key
+            else:
+                console.print(f"[red]Please enter a number between 1 and {len(workflows_list)}[/red]")
+                
+        except ValueError:
+            console.print("[red]Invalid input. Please enter a number.[/red]")
 
 def show_processing_progress(title: str, duration: int = 10):
     """Show a progress bar for processing"""
