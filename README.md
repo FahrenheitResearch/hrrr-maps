@@ -1,17 +1,25 @@
-# Weather Model Processing System
+# HRRR Derived Parameters v2.2 - Weather Model Processing System
 
-A high-performance, extensible system for downloading, processing, and visualizing weather model data from NOAA's HRRR (High-Resolution Rapid Refresh), RRFS (Rapid Refresh Forecast System), and GFS (Global Forecast System) models. Generates publication-quality meteorological maps with support for 98+ weather parameters.
+A high-performance, extensible system for downloading, processing, and visualizing weather model data from NOAA's HRRR (High-Resolution Rapid Refresh), RRFS (Rapid Refresh Forecast System), and GFS (Global Forecast System) models. **Now featuring SPC-aligned severe weather parameters** with proper Storm Prediction Center compliance and 98+ weather parameters.
 
 ## 🚀 Key Features
 
-- **Multi-Model Support**: HRRR, RRFS, and GFS models
-- **98+ Weather Parameters**: Including severe weather indices, instability parameters, smoke/fire products
+- **🎯 SPC-Aligned Parameters**: Storm Prediction Center compliant implementations (v2.2)
+- **Multi-Model Support**: HRRR, RRFS, and GFS models  
+- **98+ Weather Parameters**: Including corrected severe weather indices, instability parameters, smoke/fire products
 - **Pure NumPy Performance**: Optimized meteorological calculations without external dependencies
 - **Parallel Processing**: 8x faster map generation using multiprocessing
 - **Smart Caching**: Avoids reprocessing completed products
 - **Continuous Monitoring**: Automatically process new model runs as they become available
 - **Modular Architecture**: Clean, maintainable code organized in focused modules
 - **Professional Visualizations**: SPC-style plots with customizable colormaps
+
+### 🆕 v2.2 Highlights - SPC Compliance
+- **✅ Fixed STP**: Canonical fixed-layer with CIN term, effective-layer with EBWD/20
+- **✅ Fixed EHI**: SPC canonical (CAPE/1000 × SRH/100) alongside display-scaled version
+- **✅ Fixed SHIP**: SPC v1.1 temperature term and proper normalization constants
+- **✅ Parameter Separation**: Clear 🟢 SPC-Operational vs 🟡 Modified vs 🟡 Legacy labeling
+- **✅ Working CLI**: `processor_cli.py --latest` uses corrected implementations
 
 ## 📁 Project Structure
 
@@ -42,7 +50,7 @@ hrrr-manual-4/
 │   ├── grib_loader.py           # GRIB data extraction with cfgrib
 │   ├── metadata.py              # Metadata generation for products
 │   └── plotting.py              # Map generation with Cartopy
-├── derived_params/              # 70+ derived parameter calculations
+├── derived_params/              # 70+ derived parameter calculations (🆕 SPC-aligned v2.2)
 ├── parameters/                  # JSON configuration files by category
 │   ├── severe.json             # Severe weather parameters
 │   ├── instability.json        # CAPE, CIN, stability indices
@@ -141,8 +149,23 @@ python hrrr_cli.py interactive
 
 ## 📊 Available Weather Parameters
 
-### Categories:
-- **Severe Weather** (27 params): STP, SCP, SHIP, EHI, bulk shear, effective layer parameters
+### 🎯 SPC-Aligned Severe Weather Parameters (v2.2)
+
+| Parameter | Status | CLI Name | Description | Key Thresholds |
+|-----------|--------|----------|-------------|----------------|
+| **STP Fixed** | 🟢 SPC | `stp_fixed` | Canonical fixed-layer with CIN | >1: Sig tornado risk |
+| **STP Effective** | 🟢 SPC | `stp_effective` | Canonical effective-layer | >4: Extreme potential |
+| **EHI Canonical** | 🟢 SPC | `ehi_spc` | Standard normalization | >2: Sig tornado potential |
+| **SCP Standard** | 🟢 SPC | `scp` | Standard (no CIN term) | >1: Supercell potential |
+| **SHIP v1.1** | 🟢 SPC | `ship` | Corrected temperature term | >1: Sig hail potential |
+| **SCP with CIN** | 🟡 Modified | `scp_modified` | Enhanced with CIN | >1: Enhanced discrimination |
+| **EHI Display** | 🟡 Modified | `ehi_display` | Visualization optimized | >0.6/>1.25/>2.5 |
+| **STP No-CIN** | 🟡 Modified | `stp_fixed_no_cin` | Research variant | >1: Comparison studies |
+| **VGP Dimensionless** | 🟡 Modified | `vgp` | Normalized with K≈40 | >0.3/>0.5/>0.7 |
+| **STP Legacy** | 🟡 Legacy | `stp` | Backward compatibility | Use newer variants |
+
+### All Categories:
+- **Severe Weather** (27+ params): STP variants, SCP variants, SHIP, EHI variants, bulk shear, effective layer parameters
 - **Instability** (9 params): CAPE/CIN (surface-based, mixed-layer, most-unstable), LCL, LI
 - **Surface** (10 params): Temperature, dewpoint, pressure, winds, relative humidity
 - **Upper Air** (10 params): Heights, temperatures, winds at standard levels
@@ -155,21 +178,23 @@ python hrrr_cli.py interactive
 
 ## 🎯 Workflow Examples
 
-### 1. 🌪️ **Severe Weather Analysis** - Complete Outbreak Assessment
+### 1. 🌪️ **Severe Weather Analysis** - Complete Outbreak Assessment (🆕 SPC-Aligned)
 
 ```bash
-# Generate all severe weather products for extended forecast
+# Generate all severe weather products with SPC-compliant parameters
 python processor_cli.py 20250515 18 --hours 0-24 --categories severe,instability --workers 8
 
-# Create tornado parameter animations
+# Focus on SPC canonical tornado parameters
+python processor_cli.py 20250515 18 --hours 0-12 --fields stp_fixed,stp_effective,ehi_spc,scp --debug
+
+# Compare parameter variants for research
+python processor_cli.py 20250515 18 --hours 6-18 --fields stp_fixed,stp_effective,stp_fixed_no_cin
+
+# Create tornado parameter animations with new variants
 cd tools
 python create_gifs.py 20250515 18z --categories severe --max-hours 24 --duration 400
 
-# Quick check specific tornado parameters
-cd ..
-python processor_cli.py 20250515 18 --hours 0-12 --fields stp,srh_01km,effective_shear --debug
-
-# Output: Full severe weather analysis with 24-hour tornado parameter animations
+# Output: SPC-compliant severe weather analysis with canonical tornado parameters
 ```
 
 ### 2. 🔥 **Fire Weather Monitoring** - Real-time Smoke Tracking
@@ -303,10 +328,19 @@ python processor_cli.py --latest --fields sbcape --debug
 
 ## 📋 Quick Reference - Common Use Cases
 
+### 🎯 SPC-Aligned Parameters (v2.2)
+| **Use Case** | **Command** | **Output** |
+|--------------|-------------|------------|
+| **SPC tornado parameters** | `python processor_cli.py --latest --fields stp_fixed,stp_effective,ehi_spc` | Canonical SPC implementations |
+| **Parameter comparison** | `python processor_cli.py --latest --fields stp_fixed,stp_effective,stp_fixed_no_cin` | Compare STP variants |
+| **SPC supercell analysis** | `python processor_cli.py --latest --fields scp,scp_modified,effective_srh` | Standard vs modified SCP |
+| **Hail analysis (SPC v1.1)** | `python processor_cli.py --latest --fields ship,mucape,lapse_rate_700_500` | Corrected SHIP implementation |
+
+### General Use Cases
 | **Use Case** | **Command** | **Output** |
 |--------------|-------------|------------|
 | **Latest severe weather** | `python processor_cli.py --latest --categories severe` | Current severe weather maps |
-| **Tornado parameters now** | `python processor_cli.py --latest --fields stp,srh_01km --hours 0-3` | 3-hour tornado parameter evolution |
+| **Tornado parameters now** | `python processor_cli.py --latest --fields stp_fixed,srh_01km --hours 0-3` | 3-hour SPC tornado evolution |
 | **Smoke conditions today** | `python processor_cli.py --latest --categories smoke --hours 0-12` | 12-hour smoke forecast |
 | **Quick reflectivity check** | `python processor_cli.py --latest --fields reflectivity_comp --hours 0-1` | Current radar composite |
 | **Heat stress planning** | `python processor_cli.py --latest --categories heat --hours 6-12` | Peak heating period analysis |
