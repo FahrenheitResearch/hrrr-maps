@@ -1,4 +1,8 @@
 from .common import *
+from .constants import (
+    STP_CAPE_NORM, STP_LCL_REF, STP_LCL_NORM, STP_SRH_NORM, STP_SHEAR_NORM_SPC,
+    STP_CAPE_MIN, STP_LCL_MAX
+)
 
 def significant_tornado_parameter_fixed_no_cin(mlcape: np.ndarray, srh_01km: np.ndarray,
                                                shear_06km: np.ndarray, lcl_height: np.ndarray) -> np.ndarray:
@@ -29,18 +33,18 @@ def significant_tornado_parameter_fixed_no_cin(mlcape: np.ndarray, srh_01km: np.
     # ========================================================================
     
     # 1. CAPE term: MLCAPE/1500 (configurable cap)
-    cape_term = mlcape / 1500.0
+    cape_term = mlcape / STP_CAPE_NORM
     cape_term = np.clip(cape_term, 0.0, 1.5)  # Optional cap for extreme values
     
     # 2. LCL term: (2000-MLLCL)/1000 with proper clipping
-    lcl_term = (2000.0 - lcl_height) / 1000.0
+    lcl_term = (STP_LCL_REF - lcl_height) / STP_LCL_NORM
     lcl_term = np.clip(lcl_term, 0.0, 1.0)
     
     # 3. SRH term: SRH_01km/150 (preserve positive values only)
-    srh_term = np.maximum(srh_01km, 0.0) / 150.0
+    srh_term = np.maximum(srh_01km, 0.0) / STP_SRH_NORM
     
     # 4. Shear term: BWD_06km/20 m/s (SPC normalization)
-    shear_term = shear_06km / 20.0
+    shear_term = shear_06km / STP_SHEAR_NORM_SPC
     shear_term = np.clip(shear_term, 0.0, 1.5)  # Optional cap for extreme shear
     
     # ========================================================================
@@ -51,8 +55,8 @@ def significant_tornado_parameter_fixed_no_cin(mlcape: np.ndarray, srh_01km: np.
     # ========================================================================
     # HARD GATES - Basic thresholds
     # ========================================================================
-    stp = np.where(mlcape < 100, 0.0, stp)        # Insufficient instability
-    stp = np.where(lcl_height > 2000, 0.0, stp)   # Cloud base too high
+    stp = np.where(mlcape < STP_CAPE_MIN, 0.0, stp)        # Insufficient instability
+    stp = np.where(lcl_height > STP_LCL_MAX, 0.0, stp)     # Cloud base too high
     
     # Ensure STP is never negative
     stp = np.maximum(stp, 0.0)

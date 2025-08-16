@@ -1,6 +1,9 @@
-# 📊 HRRR Derived Parameters - Complete Documentation
+# 📊 HRRR Derived Parameters - Enhanced Reference (v2.2)
 
-> **Comprehensive documentation of 70+ meteorological derived parameters for the HRRR Map Project**
+> **⚠️ NOTICE: This document has been superseded by the main [DERIVED_PARAMETERS.md](./DERIVED_PARAMETERS.md) which contains the current v2.2 documentation with 108 parameters.**  
+> **This file is maintained for detailed implementation reference and backward compatibility.**
+
+> **Enhanced reference documentation for meteorological derived parameters**
 
 ## 📑 Table of Contents
 
@@ -43,16 +46,18 @@
 
 ---
 
-## 🌟 Overview
+## 🌟 Overview (Legacy Reference)
 
-The HRRR Derived Parameters system provides **real-time calculation** of advanced meteorological indices from High-Resolution Rapid Refresh (HRRR) model data. This comprehensive library implements official **Storm Prediction Center (SPC)** formulations alongside cutting-edge research parameters.
+**For current v2.2 documentation, see [DERIVED_PARAMETERS.md](./DERIVED_PARAMETERS.md)**
 
-### Key Features
-- ✅ **70+ meteorological parameters** across all severe weather categories
-- ✅ **SPC-compliant** formulations with proper scaling and thresholds
-- ✅ **Quality control** with input validation and extreme value detection
-- ✅ **Optimized performance** for real-time operational use
-- ✅ **Comprehensive documentation** with formulas and interpretations
+This legacy reference provides detailed implementation documentation for meteorological parameters. The main documentation now covers **108 total parameters** with full SPC alignment.
+
+### v2.2 Status
+- ✅ **108 meteorological parameters** across all severe weather categories (updated count)
+- ✅ **SPC-compliant** canonical implementations with proper EBWD/20 normalization
+- ✅ **Centralized constants** module prevents parameter drift
+- ✅ **Transport wind methodology** for improved fire weather calculations
+- ✅ **Status badge system** for operational confidence
 
 ### Categories
 

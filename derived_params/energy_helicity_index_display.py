@@ -1,4 +1,5 @@
 from .common import *
+from .constants import EHI_NORM_DISPLAY, EHI_DAMPING_THRESHOLD
 
 def energy_helicity_index_display(cape: np.ndarray, srh_03km: np.ndarray) -> np.ndarray:
     """
@@ -31,12 +32,12 @@ def energy_helicity_index_display(cape: np.ndarray, srh_03km: np.ndarray) -> np.
     # DISPLAY-SCALED EHI CALCULATION
     # ========================================================================
     # Display-scaled calculation: /160,000 instead of canonical /100,000
-    ehi_raw = (cape * srh_03km) / 160000.0
+    ehi_raw = (cape * srh_03km) / EHI_NORM_DISPLAY
     
     # Apply damping factor to prevent extreme oversaturation
     # Damping kicks in when |EHI| > 5, scales down exponentially for extreme values
     ehi_abs = np.abs(ehi_raw)
-    damping_threshold = 5.0
+    damping_threshold = EHI_DAMPING_THRESHOLD
     
     # Exponential damping: factor = threshold + log(ehi_abs/threshold) for values > threshold
     # This compresses extreme values while preserving moderate ones

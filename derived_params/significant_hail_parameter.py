@@ -1,13 +1,9 @@
 from .common import *
 from ._mixing_ratio_approximation import _mixing_ratio_approximation
-
-# SPC SHIP v1.1 Constants
-SHIP_CAPE_NORM = 1500.0      # J/kg
-SHIP_MR_NORM = 13.6          # g/kg  
-SHIP_LAPSE_NORM = 7.0        # °C/km
-SHIP_SHEAR_NORM = 20.0       # m/s
-SHIP_TEMP_REF = -20.0        # °C
-SHIP_TEMP_NORM = 5.0         # °C
+from .constants import (
+    SHIP_CAPE_NORM, SHIP_MR_NORM, SHIP_LAPSE_NORM, SHIP_SHEAR_NORM,
+    SHIP_TEMP_REF, SHIP_TEMP_NORM, SHIP_CAPE_MIN
+)
 
 def significant_hail_parameter(mucape: np.ndarray, mucin: np.ndarray,
                              lapse_rate_700_500: np.ndarray, 
@@ -115,7 +111,7 @@ def significant_hail_parameter(mucape: np.ndarray, mucin: np.ndarray,
     ship = np.where(valid_mask & (ship >= 0), ship, 0.0)
     
     # Apply low-CAPE mask to reduce noise
-    low_cape_mask = mucape < 100.0  # J/kg threshold
+    low_cape_mask = mucape < SHIP_CAPE_MIN
     ship = np.where(low_cape_mask, 0.0, ship)
     
     return ship

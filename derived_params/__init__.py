@@ -53,7 +53,7 @@ from .turbulent_kinetic_energy_estimate import turbulent_kinetic_energy_estimate
 from .haines_index import haines_index
 from .ventilation_rate import ventilation_rate
 from .enhanced_smoke_dispersion_index import enhanced_smoke_dispersion_index
-from .ventilation_rate_from_components import ventilation_rate_from_components
+from .ventilation_rate_from_components import ventilation_rate_from_components, ventilation_rate_from_surface_winds
 from .enhanced_smoke_dispersion_index_simplified import enhanced_smoke_dispersion_index_simplified
 from .shear_vector_magnitude_ratio_from_components import shear_vector_magnitude_ratio_from_components
 from .enhanced_smoke_dispersion_index_from_components import enhanced_smoke_dispersion_index_from_components
@@ -129,6 +129,7 @@ _DERIVED_FUNCTIONS = {
     'ventilation_rate': ventilation_rate,
     'enhanced_smoke_dispersion_index': enhanced_smoke_dispersion_index,
     'ventilation_rate_from_components': ventilation_rate_from_components,
+    'ventilation_rate_from_surface_winds': ventilation_rate_from_surface_winds,
     'enhanced_smoke_dispersion_index_simplified': enhanced_smoke_dispersion_index_simplified,
     'shear_vector_magnitude_ratio_from_components': shear_vector_magnitude_ratio_from_components,
     'enhanced_smoke_dispersion_index_from_components': enhanced_smoke_dispersion_index_from_components,
@@ -449,6 +450,7 @@ class DerivedParameters:
     ventilation_rate = staticmethod(ventilation_rate)
     enhanced_smoke_dispersion_index = staticmethod(enhanced_smoke_dispersion_index)
     ventilation_rate_from_components = staticmethod(ventilation_rate_from_components)
+    ventilation_rate_from_surface_winds = staticmethod(ventilation_rate_from_surface_winds)
     enhanced_smoke_dispersion_index_simplified = staticmethod(enhanced_smoke_dispersion_index_simplified)
     shear_vector_magnitude_ratio_from_components = staticmethod(shear_vector_magnitude_ratio_from_components)
     enhanced_smoke_dispersion_index_from_components = staticmethod(enhanced_smoke_dispersion_index_from_components)

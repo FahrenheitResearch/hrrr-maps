@@ -1,4 +1,5 @@
 from .common import *
+from .constants import EHI_NORM_SPC
 
 def energy_helicity_index(cape: np.ndarray, srh_03km: np.ndarray) -> np.ndarray:
     """
@@ -33,7 +34,7 @@ def energy_helicity_index(cape: np.ndarray, srh_03km: np.ndarray) -> np.ndarray:
     # SPC CANONICAL EHI CALCULATION
     # ========================================================================
     # Standard EHI calculation per Davies (1993) and SPC: (CAPE/1000) × (SRH/100)
-    ehi = (cape * srh_03km) / 100000.0
+    ehi = (cape * srh_03km) / EHI_NORM_SPC
     
     # Mask invalid input data (but preserve negative SRH sign)
     ehi = np.where((cape < 0) | (np.isnan(cape)) | (np.isnan(srh_03km)), 

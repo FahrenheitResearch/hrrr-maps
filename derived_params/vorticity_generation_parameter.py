@@ -1,7 +1,8 @@
 from .common import *
+from .constants import VGP_K_DEFAULT
 
 def vorticity_generation_parameter(cape: np.ndarray, 
-                                 wind_shear_01km: np.ndarray, K: float = 40.0) -> np.ndarray:
+                                 wind_shear_01km: np.ndarray, K: float = VGP_K_DEFAULT) -> np.ndarray:
     """
     Compute Vorticity Generation Parameter (VGP) - Dimensionless Definition
     

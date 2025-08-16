@@ -1,4 +1,8 @@
 from .common import *
+from .constants import (
+    STP_CAPE_NORM, STP_LCL_REF, STP_LCL_NORM, STP_SRH_NORM, STP_SHEAR_NORM_SPC,
+    STP_CIN_OFFSET, STP_CIN_NORM, STP_CAPE_MIN, STP_CIN_GATE, STP_LCL_MAX
+)
 
 def significant_tornado_parameter_fixed(mlcape: np.ndarray, mlcin: np.ndarray, 
                                        srh_01km: np.ndarray, shear_06km: np.ndarray, 
@@ -43,26 +47,26 @@ def significant_tornado_parameter_fixed(mlcape: np.ndarray, mlcin: np.ndarray,
     # ========================================================================
     
     # 1. CAPE term: MLCAPE/1500 (configurable cap)
-    cape_term = mlcape / 1500.0
+    cape_term = mlcape / STP_CAPE_NORM
     cape_term = np.clip(cape_term, 0.0, 1.5)  # Optional cap for extreme values
     
     # 2. LCL term: (2000-MLLCL)/1000 with proper clipping
     # LCL < 1000m → 1.0 (extremely favorable)
     # LCL > 2000m → 0.0 (unfavorable, high cloud base)
-    lcl_term = (2000.0 - lcl_height) / 1000.0
+    lcl_term = (STP_LCL_REF - lcl_height) / STP_LCL_NORM
     lcl_term = np.clip(lcl_term, 0.0, 1.0)
     
     # 3. SRH term: SRH_01km/150 (preserve positive values only)
-    srh_term = np.maximum(srh_01km, 0.0) / 150.0
+    srh_term = np.maximum(srh_01km, 0.0) / STP_SRH_NORM
     
     # 4. Shear term: BWD_06km/20 m/s (SPC normalization)
-    shear_term = shear_06km / 20.0
+    shear_term = shear_06km / STP_SHEAR_NORM_SPC
     shear_term = np.clip(shear_term, 0.0, 1.5)  # Optional cap for extreme shear
     
     # 5. CIN term: (150+MLCIN)/125 with proper clipping [SPC 2012 update]
     # Strong CIN (< -200 J/kg) → 0.0 (complete inhibition)
     # Weak CIN (> -50 J/kg) → near 1.0 (little inhibition)
-    cin_term = (150.0 + mlcin) / 125.0
+    cin_term = (STP_CIN_OFFSET + mlcin) / STP_CIN_NORM
     cin_term = np.clip(cin_term, 0.0, 1.0)
     
     # ========================================================================
@@ -73,9 +77,9 @@ def significant_tornado_parameter_fixed(mlcape: np.ndarray, mlcin: np.ndarray,
     # ========================================================================
     # HARD GATES - SPC standard thresholds
     # ========================================================================
-    stp = np.where(mlcape < 100, 0.0, stp)        # Insufficient instability
-    stp = np.where(mlcin <= -200, 0.0, stp)       # Excessive inhibition
-    stp = np.where(lcl_height > 2000, 0.0, stp)   # Cloud base too high
+    stp = np.where(mlcape < STP_CAPE_MIN, 0.0, stp)        # Insufficient instability
+    stp = np.where(mlcin <= STP_CIN_GATE, 0.0, stp)        # Excessive inhibition
+    stp = np.where(lcl_height > STP_LCL_MAX, 0.0, stp)     # Cloud base too high
     
     # Ensure STP is never negative
     stp = np.maximum(stp, 0.0)

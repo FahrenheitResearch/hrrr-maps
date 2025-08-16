@@ -1,4 +1,9 @@
 from .common import *
+from .constants import (
+    STP_CAPE_NORM, STP_LCL_REF, STP_LCL_NORM, STP_SRH_NORM, STP_SHEAR_NORM_SPC,
+    STP_CIN_OFFSET, STP_CIN_NORM, STP_CAPE_MIN, STP_CIN_GATE, STP_LCL_MAX,
+    STP_SHEAR_MIN, STP_SHEAR_CAP, STP_SHEAR_CAP_FACTOR
+)
 
 def significant_tornado_parameter_effective(mlcape: np.ndarray, mlcin: np.ndarray,
                                           effective_srh: np.ndarray, effective_shear: np.ndarray,
@@ -32,24 +37,24 @@ def significant_tornado_parameter_effective(mlcape: np.ndarray, mlcin: np.ndarra
         SPC Mesoanalysis Page: Current operational implementation
     """
     # 1. CAPE term: MLCAPE/1500 (no arbitrary cap)
-    cape_term = np.maximum(mlcape / 1500.0, 0)
+    cape_term = np.maximum(mlcape / STP_CAPE_NORM, 0)
     
     # 2. LCL term: (2000-MLLCL)/1000 with proper clipping
     # MLLCL < 1000m → 1.0 (extremely favorable low cloud base)
     # MLLCL > 2000m → 0.0 (unfavorable high cloud base)
-    lcl_term = np.where(mllcl_height < 1000, 1.0,
-                       np.where(mllcl_height > 2000, 0.0,
-                               (2000 - mllcl_height) / 1000.0))
+    lcl_term = np.where(mllcl_height < STP_LCL_NORM, 1.0,
+                       np.where(mllcl_height > STP_LCL_REF, 0.0,
+                               (STP_LCL_REF - mllcl_height) / STP_LCL_NORM))
     
     # 3. Effective SRH term: Effective_SRH/150 (preserve sign but cap negative)
-    srh_term = np.maximum(effective_srh / 150.0, 0)
+    srh_term = np.maximum(effective_srh / STP_SRH_NORM, 0)
     
     # 4. Effective Shear term: EBWD/20 m/s with SPC clipping
     # < 12.5 m/s (25 kt) → 0 (insufficient shear)
     # > 30 m/s (60 kt) → cap at 1.5 (diminishing returns)
-    shear_term = np.where(effective_shear < 12.5, 0,
-                         np.where(effective_shear > 30, 1.5, 
-                                 effective_shear / 20.0))
+    shear_term = np.where(effective_shear < STP_SHEAR_MIN, 0,
+                         np.where(effective_shear > STP_SHEAR_CAP, STP_SHEAR_CAP_FACTOR, 
+                                 effective_shear / STP_SHEAR_NORM_SPC))
     
     # ========================================================================
     # MLCIN SIGN FIX - Ensure HRRR MLCIN field is negative
@@ -60,16 +65,16 @@ def significant_tornado_parameter_effective(mlcape: np.ndarray, mlcin: np.ndarra
     # 5. CIN term: (150 + MLCIN)/125 - SPC standard formula  
     # Strong CIN (< -200 J/kg) → 0.0 (complete inhibition)
     # Weak CIN (> -50 J/kg) → near 1.0 (little inhibition)
-    cin_term = (150.0 + mlcin) / 125.0
+    cin_term = (STP_CIN_OFFSET + mlcin) / STP_CIN_NORM
     cin_term = np.clip(cin_term, 0.0, 1.0)
     
     # Enhanced STP calculation (multiplicative)
     stp_eff = cape_term * lcl_term * srh_term * shear_term * cin_term
     
     # Hard zeros for unphysical conditions - ANY of these makes STP = 0
-    stp_eff = np.where(mlcape < 100, 0.0, stp_eff)         # Insufficient instability
-    stp_eff = np.where(mlcin <= -200, 0.0, stp_eff)        # Too strong inhibition
-    stp_eff = np.where(mllcl_height > 2000, 0.0, stp_eff)  # Cloud base too high
+    stp_eff = np.where(mlcape < STP_CAPE_MIN, 0.0, stp_eff)         # Insufficient instability
+    stp_eff = np.where(mlcin <= STP_CIN_GATE, 0.0, stp_eff)         # Too strong inhibition
+    stp_eff = np.where(mllcl_height > STP_LCL_MAX, 0.0, stp_eff)    # Cloud base too high
     
     # Ensure STP is never negative
     stp_eff = np.maximum(stp_eff, 0.0)

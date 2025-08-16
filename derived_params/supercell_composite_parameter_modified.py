@@ -1,4 +1,8 @@
 from .common import *
+from .constants import (
+    SCP_CAPE_NORM, SCP_SRH_NORM, SCP_SHEAR_MIN, SCP_SHEAR_SPAN,
+    SCP_CIN_WEAK_GATE, CAPE_MIN_CONVECTION
+)
 
 def supercell_composite_parameter_modified(mucape: np.ndarray, effective_srh: np.ndarray, 
                                          effective_shear: np.ndarray, mucin: np.ndarray) -> np.ndarray:
@@ -50,13 +54,13 @@ def supercell_composite_parameter_modified(mucape: np.ndarray, effective_srh: np
     # ========================================================================
     # 1. CAPE TERM - muCAPE ÷ 1000
     # ========================================================================
-    cape_term = mucape / 1000.0
+    cape_term = mucape / SCP_CAPE_NORM
     
     # ========================================================================
     # 2. SRH TERM - ESRH ÷ 50 (force negative values to 0)
     # ========================================================================
     srh_positive = np.maximum(effective_srh, 0.0)  # Force negatives to 0 first
-    srh_term = srh_positive / 50.0
+    srh_term = srh_positive / SCP_SRH_NORM
     
     # ========================================================================
     # 3. SHEAR TERM - SPC-compliant piecewise EBWD scaling
@@ -64,7 +68,7 @@ def supercell_composite_parameter_modified(mucape: np.ndarray, effective_srh: np
     # 0 when EBWD < 10 m/s
     # linear from 0→1 between 10–20 m/s: (EBWD-10)/10
     # 1 once EBWD ≥ 20 m/s
-    shear_term = np.clip((effective_shear - 10.0) / 10.0, 0.0, 1.0)
+    shear_term = np.clip((effective_shear - SCP_SHEAR_MIN) / SCP_SHEAR_SPAN, 0.0, 1.0)
     
     # ========================================================================
     # 4. CIN WEIGHT - Project-specific enhancement
@@ -72,9 +76,9 @@ def supercell_composite_parameter_modified(mucape: np.ndarray, effective_srh: np
     # If inhibition is weak (muCIN > -40 J/kg), no penalty (weight = 1.0)
     # Otherwise, proportional penalty: -40 / muCIN
     cin_weight = np.where(
-        mucin > -40.0,            # Weak inhibition
-        1.0,                      # No penalty
-        -40.0 / mucin             # Proportional penalty
+        mucin > SCP_CIN_WEAK_GATE,     # Weak inhibition
+        1.0,                           # No penalty
+        SCP_CIN_WEAK_GATE / mucin      # Proportional penalty
     )
     # Ensure valid range (should be 0.0 to 1.0 naturally)
     cin_weight = np.clip(cin_weight, 0.0, 1.0)
@@ -99,7 +103,7 @@ def supercell_composite_parameter_modified(mucape: np.ndarray, effective_srh: np
     scp = np.where(valid_data & np.isfinite(scp) & (scp >= 0), scp, 0.0)
     
     # Mask low-CAPE areas (insufficient instability for supercells)
-    scp = np.where(mucape < 100.0, 0.0, scp)  # J/kg threshold
+    scp = np.where(mucape < CAPE_MIN_CONVECTION, 0.0, scp)  # J/kg threshold
     
     # Ensure SCP is never negative (should not happen with above logic)
     scp = np.maximum(scp, 0.0)
