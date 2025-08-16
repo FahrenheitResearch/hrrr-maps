@@ -12,7 +12,7 @@ from datetime import datetime
 from multiprocessing import Pool, cpu_count
 import shutil
 
-from processor_base import HRRRProcessor
+from .processor_core import HRRRProcessor
 from field_registry import FieldRegistry
 from derived_params import compute_derived_parameter
 
