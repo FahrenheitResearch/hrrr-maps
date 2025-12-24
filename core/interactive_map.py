@@ -75,12 +75,24 @@ def create_interactive_map(
         lons_sub = lons[::step] if lons.ndim == 1 else lons[::step, ::step]
 
         # Create color-mapped image
-        cmap = plt.get_cmap(colormap)
+        # Handle custom colormaps - fall back to standard ones
+        try:
+            cmap = plt.get_cmap(colormap)
+        except ValueError:
+            # Custom colormap not available, use appropriate fallback
+            if 'reflectivity' in field_name.lower() or 'refl' in colormap.lower():
+                cmap = plt.get_cmap('turbo')  # Good for radar
+            else:
+                cmap = plt.get_cmap('viridis')
         norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
         # Normalize values and apply colormap
         values_norm = norm(values_sub)
         rgba = cmap(values_norm)
+
+        # Mask values below vmin (make transparent) - important for reflectivity
+        mask = values_sub < vmin
+        rgba[mask, 3] = 0  # Set alpha to 0 for masked values
 
         # Convert to uint8 for PNG
         rgba_uint8 = (rgba * 255).astype(np.uint8)
