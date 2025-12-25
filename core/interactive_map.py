@@ -129,8 +129,8 @@ def create_interactive_map(
         ).add_to(m)
 
         # Prepare data for JavaScript hover lookup
-        # Subsample more aggressively for 2D grids to reduce file size and search time
-        hover_step = 4 if lats_sub.ndim == 2 else 2
+        # Use minimal subsampling to keep accuracy
+        hover_step = 2
         values_js = values_sub[::hover_step, ::hover_step]
 
         if lats_sub.ndim == 1:
@@ -139,6 +139,9 @@ def create_interactive_map(
         else:
             lats_js = lats_sub[::hover_step, ::hover_step]
             lons_js = lons_sub[::hover_step, ::hover_step]
+
+        # Keep lons in same format as image bounds (-180 to 180)
+        # No conversion needed since lons was already converted above
 
         # Convert to lists - show actual values (even negative for reflectivity)
         values_list = np.where(np.isnan(values_js), None, np.round(values_js, 1)).tolist()
@@ -180,15 +183,12 @@ def create_interactive_map(
                 var lons = weatherData.lons;
                 var values = weatherData.values;
 
-                // Convert lon to 0-360 if needed (HRRR uses 0-360)
-                var lonAdj = lon < 0 ? lon + 360 : lon;
-
-                // Find nearest point in flattened grid
+                // Find nearest point in flattened grid (lons are in -180 to 180 format)
                 var minDist = Infinity;
                 var bestIdx = -1;
                 for (var i = 0; i < lats.length; i++) {{
                     var dLat = lats[i] - lat;
-                    var dLon = lons[i] - lonAdj;
+                    var dLon = lons[i] - lon;
                     var dist = dLat*dLat + dLon*dLon;
                     if (dist < minDist) {{
                         minDist = dist;
