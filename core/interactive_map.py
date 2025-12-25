@@ -129,19 +129,31 @@ def create_interactive_map(
         ).add_to(m)
 
         # Prepare data for JavaScript hover lookup
-        # Subsample for the data array - ~265x450 grid for hover (reasonable file size)
-        data_step = 2
-        values_js = values_sub[::data_step, ::data_step]
+        # Use same subsampling as image for alignment
+        values_js = values_sub.copy()
+
+        # Mask values below vmin in hover data too (show as null)
+        values_js = np.where(values_js < vmin, np.nan, values_js)
 
         if lats_sub.ndim == 1:
-            lats_js = lats_sub[::data_step]
-            lons_js = lons_sub[::data_step]
+            lats_js = lats_sub
+            lons_js = lons_sub
         else:
-            lats_js = lats_sub[::data_step, ::data_step]
-            lons_js = lons_sub[::data_step, ::data_step]
+            lats_js = lats_sub
+            lons_js = lons_sub
 
-        # Convert to lists, handling NaN values
-        values_list = np.where(np.isnan(values_js), None, np.round(values_js, 2)).tolist()
+        # Further subsample for file size, but keep alignment
+        hover_step = 2
+        values_js = values_js[::hover_step, ::hover_step]
+        if lats_js.ndim == 1:
+            lats_js = lats_js[::hover_step]
+            lons_js = lons_js[::hover_step]
+        else:
+            lats_js = lats_js[::hover_step, ::hover_step]
+            lons_js = lons_js[::hover_step, ::hover_step]
+
+        # Convert to lists, handling NaN/masked values
+        values_list = np.where(np.isnan(values_js), None, np.round(values_js, 1)).tolist()
 
         if lats_js.ndim == 1:
             lats_list = lats_js.tolist()
@@ -225,12 +237,11 @@ def create_interactive_map(
                         var lat = e.latlng.lat;
                         var lon = e.latlng.lng;
                         var val = findNearestValue(lat, lon);
-                        if (val !== null) {{
-                            info.innerHTML = '<b>{title}</b><br>' +
-                                'Lat: ' + lat.toFixed(2) + '°<br>' +
-                                'Lon: ' + lon.toFixed(2) + '°<br>' +
-                                '<b>Value: ' + val + ' {units}</b>';
-                        }}
+                        var valStr = (val === null) ? 'No data' : val + ' {units}';
+                        info.innerHTML = '<b>{title}</b><br>' +
+                            'Lat: ' + lat.toFixed(2) + '°<br>' +
+                            'Lon: ' + lon.toFixed(2) + '°<br>' +
+                            '<b>Value: ' + valStr + '</b>';
                     }});
 
                     // Find the image overlay and connect opacity slider
