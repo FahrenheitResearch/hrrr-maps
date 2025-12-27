@@ -9,9 +9,11 @@ build/
 
 # Outputs and data
 outputs/
+cache/
 *.grib2
 *.idx
 *.nc
+*.npz
 
 # Logs
 *.log

@@ -65,6 +65,8 @@ create_cross_section_animation(
 
 ## Available Styles
 
+### Original Styles
+
 | Style | Shading Variable | Colormap | Use Case |
 |-------|-----------------|----------|----------|
 | `wind_speed` | Wind speed (kts) | White→Blue→Orange→Red | Jet stream, wind maxima |
@@ -72,6 +74,27 @@ create_cross_section_animation(
 | `omega` | Vertical velocity (hPa/hr) | Blue↔Red (diverging) | Rising (blue) / sinking (red) motion |
 | `vorticity` | Absolute vorticity (10⁻⁵ s⁻¹) | Blue↔Red (diverging) | Cyclonic/anticyclonic patterns |
 | `cloud` | Cloud mixing ratio (g/kg) | White→Blue | Cloud layers, precipitation potential |
+
+### Extended Styles (Operational Meteorology)
+
+| Style | Shading Variable | Colormap | Use Case |
+|-------|-----------------|----------|----------|
+| `temp` | Temperature (°C) | Coolwarm | Temperature structure, inversions |
+| `theta_e` | Equiv. Potential Temp (K) | Spectral | Warm/cold advection, instability |
+| `q` | Specific Humidity (g/kg) | YlGnBu | Moisture transport, tropical plumes |
+| `cloud_total` | Total Condensate (g/kg) | White→Purple | All hydrometeors (cloud+rain+snow+graupel) |
+| `shear` | Vertical Wind Shear (10⁻³/s) | OrRd | Jet cores, turbulence potential |
+| `wetbulb` | Wet-Bulb Temperature (°C) | Coolwarm | Snow/rain transition, precipitation type |
+| `icing` | SLW Icing Proxy (g/kg) | Purple gradient | Aircraft icing hazard (0 to -20°C) |
+| `lapse_rate` | Temperature Lapse Rate (°C/km) | RdYlBu_r | Stability analysis, convective potential |
+
+### Style-Specific Overlays
+
+- **`temp`**: Adds -10°C, -20°C, -30°C isotherms (cyan/blue/navy dashed lines)
+- **`q`**: Adds RH contours at 70%, 80%, 90% (green dotted lines)
+- **`wetbulb`**: Adds wet-bulb 0°C line (lime, critical for rain/snow transition)
+- **`icing`**: Adds 0°C, -10°C, -20°C isotherms for icing context
+- **`lapse_rate`**: Adds reference lines at 6°C/km (moist adiabatic) and 9.8°C/km (dry adiabatic)
 
 All styles include:
 - **Theta contours** (black lines, every 4K) - shows atmospheric stability
@@ -87,15 +110,25 @@ All styles include:
 We use `cfgrib` to read GRIB2 files, extracting fields on isobaric (pressure) levels:
 
 ```python
-# Fields extracted from wrfprs files
-fields = {
-    't': 'temperature',      # Temperature (K)
+# Fields extracted from wrfprs files (style-dependent)
+base_fields = {
+    't': 'temperature',      # Temperature (K) - always needed for theta
+    'u': 'u_wind',           # U-wind component (m/s) - always needed for barbs
+    'v': 'v_wind',           # V-wind component (m/s) - always needed for barbs
+}
+
+# Additional fields loaded based on style
+style_fields = {
     'r': 'rh',               # Relative Humidity (%)
-    'u': 'u_wind',           # U-wind component (m/s)
-    'v': 'v_wind',           # V-wind component (m/s)
     'w': 'omega',            # Vertical velocity (Pa/s)
     'absv': 'vorticity',     # Absolute vorticity (1/s)
     'clwmr': 'cloud',        # Cloud mixing ratio (kg/kg)
+    'q': 'specific_humidity', # Specific humidity (kg/kg)
+    'gh': 'geopotential_height', # Geopotential height (gpm)
+    'dpt': 'dew_point',      # Dew point temperature (K)
+    'rwmr': 'rain',          # Rain mixing ratio (kg/kg)
+    'snmr': 'snow',          # Snow mixing ratio (kg/kg)
+    'grle': 'graupel',       # Graupel mixing ratio (kg/kg)
 }
 ```
 
