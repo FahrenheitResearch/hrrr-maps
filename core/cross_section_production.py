@@ -58,6 +58,29 @@ def extract_cross_section_multi_fields(
             fields_to_load['absv'] = 'vorticity'
         elif style == "cloud":
             fields_to_load['clwmr'] = 'cloud'
+        # NEW STYLES
+        elif style == "temp":
+            pass  # t already loaded for theta
+        elif style == "theta_e":
+            fields_to_load['q'] = 'specific_humidity'
+            fields_to_load['r'] = 'rh'  # For overlay
+        elif style == "q":
+            fields_to_load['q'] = 'specific_humidity'
+            fields_to_load['r'] = 'rh'  # For RH contour overlay
+        elif style == "cloud_total":
+            fields_to_load['clwmr'] = 'cloud'
+            fields_to_load['rwmr'] = 'rain'
+            fields_to_load['snmr'] = 'snow'
+            fields_to_load['grle'] = 'graupel'
+        elif style == "shear":
+            fields_to_load['gh'] = 'geopotential_height'
+        elif style == "wetbulb":
+            fields_to_load['dpt'] = 'dew_point'
+            fields_to_load['r'] = 'rh'
+        elif style == "icing":
+            fields_to_load['clwmr'] = 'cloud'
+        elif style == "lapse_rate":
+            fields_to_load['gh'] = 'geopotential_height'
         else:
             # Load all for unknown styles
             fields_to_load.update({
@@ -227,6 +250,118 @@ def extract_cross_section_multi_fields(
 
             result['theta'] = theta
             print(f"Computed theta: {theta.min():.1f} to {theta.max():.1f} K")
+
+        # Compute temperature in Celsius (for temp style and overlays)
+        if 'temperature' in result:
+            result['temp_c'] = result['temperature'] - 273.15
+
+        # Compute equivalent potential temperature (theta_e)
+        if style == "theta_e" and 'specific_humidity' in result and 'temperature' in result:
+            T = result['temperature']  # K
+            q = result['specific_humidity']  # kg/kg
+            P = result['pressure_levels']  # hPa
+            theta = result['theta']
+
+            # Simplified Bolton (1980) approximation for theta_e
+            # theta_e ≈ theta * exp(Lv * q / (cp * T))
+            Lv = 2.5e6  # Latent heat of vaporization (J/kg)
+            cp = 1004.0  # Specific heat of dry air (J/kg/K)
+
+            theta_e = np.zeros_like(T)
+            for lev_idx in range(len(P)):
+                theta_e[lev_idx, :] = theta[lev_idx, :] * np.exp(
+                    Lv * q[lev_idx, :] / (cp * T[lev_idx, :])
+                )
+
+            result['theta_e'] = theta_e
+            print(f"Computed theta_e: {np.nanmin(theta_e):.1f} to {np.nanmax(theta_e):.1f} K")
+
+        # Compute total cloud condensate
+        if style == "cloud_total":
+            total = np.zeros_like(result.get('cloud', np.zeros((len(result['pressure_levels']), n_points))))
+            for field in ['cloud', 'rain', 'snow', 'graupel']:
+                if field in result:
+                    total = total + result[field]
+            result['cloud_total'] = total * 1000  # kg/kg to g/kg
+            print(f"Computed cloud_total: {np.nanmin(result['cloud_total']):.3f} to {np.nanmax(result['cloud_total']):.3f} g/kg")
+
+        # Compute vertical wind shear
+        if style == "shear" and 'geopotential_height' in result and 'u_wind' in result:
+            u = result['u_wind']  # m/s
+            v = result['v_wind']  # m/s
+            gh = result['geopotential_height']  # gpm
+            P = result['pressure_levels']
+
+            # Shear is computed between adjacent levels
+            n_lev = len(P)
+            shear = np.full((n_lev, n_points), np.nan)
+
+            for lev_idx in range(n_lev - 1):
+                # Height difference in meters
+                dz = (gh[lev_idx, :] - gh[lev_idx + 1, :])  # Higher level minus lower level
+                dz = np.where(np.abs(dz) < 10, np.nan, dz)  # Avoid division by tiny dz
+
+                # Wind difference
+                du = u[lev_idx, :] - u[lev_idx + 1, :]
+                dv = v[lev_idx, :] - v[lev_idx + 1, :]
+                dwind = np.sqrt(du**2 + dv**2)
+
+                # Shear in 1/s, multiply by 1000 for display (10^-3 /s)
+                shear[lev_idx, :] = (dwind / np.abs(dz)) * 1000
+
+            # Fill bottom level with level above
+            shear[-1, :] = shear[-2, :]
+            result['shear'] = shear
+            print(f"Computed shear: {np.nanmin(shear):.2f} to {np.nanmax(shear):.2f} (10⁻³/s)")
+
+        # Compute wet-bulb temperature (Stull 2011 approximation)
+        if style == "wetbulb" and 'rh' in result and 'temperature' in result:
+            T_c = result['temperature'] - 273.15  # Celsius
+            RH = result['rh']  # %
+
+            # Stull (2011) formula
+            Tw = (T_c * np.arctan(0.151977 * np.sqrt(RH + 8.313659))
+                  + np.arctan(T_c + RH)
+                  - np.arctan(RH - 1.676331)
+                  + 0.00391838 * (RH ** 1.5) * np.arctan(0.023101 * RH)
+                  - 4.686035)
+
+            result['wetbulb'] = Tw
+            print(f"Computed wetbulb: {np.nanmin(Tw):.1f} to {np.nanmax(Tw):.1f} °C")
+
+        # Compute icing proxy (supercooled liquid water)
+        if style == "icing" and 'cloud' in result and 'temperature' in result:
+            T_c = result['temperature'] - 273.15
+            cloud = result['cloud'] * 1000  # g/kg
+
+            # Icing occurs where cloud water exists and T is between 0 and -20°C
+            icing = np.where((T_c >= -20) & (T_c <= 0), cloud, 0)
+            result['icing'] = icing
+            print(f"Computed icing proxy: {np.nanmin(icing):.3f} to {np.nanmax(icing):.3f} g/kg")
+
+        # Compute temperature lapse rate
+        if style == "lapse_rate" and 'geopotential_height' in result and 'temperature' in result:
+            T = result['temperature']  # K
+            gh = result['geopotential_height']  # gpm
+            P = result['pressure_levels']
+
+            n_lev = len(P)
+            lapse = np.full((n_lev, n_points), np.nan)
+
+            for lev_idx in range(n_lev - 1):
+                # Height difference in km
+                dz = (gh[lev_idx, :] - gh[lev_idx + 1, :]) / 1000.0
+                dz = np.where(np.abs(dz) < 0.01, np.nan, dz)
+
+                # Temperature difference (K = C for differences)
+                dT = T[lev_idx, :] - T[lev_idx + 1, :]
+
+                # Lapse rate in °C/km (positive = temp decreases with height)
+                lapse[lev_idx, :] = -dT / dz
+
+            lapse[-1, :] = lapse[-2, :]
+            result['lapse_rate'] = lapse
+            print(f"Computed lapse rate: {np.nanmin(lapse):.1f} to {np.nanmax(lapse):.1f} °C/km")
 
         # Check we have minimum required fields (theta and pressure are always needed)
         required = ['theta', 'pressure_levels']
@@ -427,6 +562,225 @@ def create_production_cross_section(
             else:
                 style = "rh"
 
+        # === NEW STYLES ===
+
+        elif style == "temp":
+            # Temperature in Celsius (coolwarm colormap)
+            temp_c = data.get('temp_c')
+            if temp_c is not None:
+                # Apply terrain mask
+                if surface_pressure is not None:
+                    temp_c = temp_c.copy()
+                    for i in range(n_points):
+                        sp = surface_pressure[i]
+                        for lev_idx, plev in enumerate(pressure_levels):
+                            if plev > sp:
+                                temp_c[lev_idx, i] = np.nan
+
+                temp_levels = np.arange(-60, 45, 5)
+                cf = ax.contourf(X, Y, temp_c, levels=temp_levels, cmap='coolwarm', extend='both')
+                cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.9)
+                cbar.set_label('Temperature (°C)', fontsize=11)
+                shading_label = "T(°C)"
+
+                # Add key isotherms (-10, -20, -30°C)
+                for t_val, color, ls in [(-10, 'cyan', '--'), (-20, 'blue', '--'), (-30, 'navy', ':')]:
+                    try:
+                        cs_temp = ax.contour(X, Y, temp_c, levels=[t_val], colors=color, linewidths=1.5, linestyles=ls)
+                        ax.clabel(cs_temp, inline=True, fontsize=8, fmt='%d°C')
+                    except:
+                        pass
+            else:
+                style = "rh"
+
+        elif style == "theta_e":
+            # Equivalent potential temperature (spectral colormap)
+            theta_e = data.get('theta_e')
+            if theta_e is not None:
+                # Apply terrain mask
+                if surface_pressure is not None:
+                    theta_e = theta_e.copy()
+                    for i in range(n_points):
+                        sp = surface_pressure[i]
+                        for lev_idx, plev in enumerate(pressure_levels):
+                            if plev > sp:
+                                theta_e[lev_idx, i] = np.nan
+
+                theta_e_levels = np.arange(280, 365, 4)
+                cf = ax.contourf(X, Y, theta_e, levels=theta_e_levels, cmap='Spectral_r', extend='both')
+                cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.9)
+                cbar.set_label('θₑ (K)', fontsize=11)
+                shading_label = "θₑ(K)"
+            else:
+                style = "rh"
+
+        elif style == "q":
+            # Specific humidity (blues colormap)
+            q = data.get('specific_humidity')
+            if q is not None:
+                # Apply terrain mask
+                if surface_pressure is not None:
+                    q = q.copy()
+                    for i in range(n_points):
+                        sp = surface_pressure[i]
+                        for lev_idx, plev in enumerate(pressure_levels):
+                            if plev > sp:
+                                q[lev_idx, i] = np.nan
+
+                # Convert kg/kg to g/kg
+                q_display = q * 1000
+                q_levels = np.linspace(0, 16, 17)
+                cf = ax.contourf(X, Y, q_display, levels=q_levels, cmap='YlGnBu', extend='max')
+                cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.9)
+                cbar.set_label('Specific Humidity (g/kg)', fontsize=11)
+                shading_label = "q(g/kg)"
+
+                # Add optional RH contours
+                rh = data.get('rh')
+                if rh is not None:
+                    try:
+                        cs_rh = ax.contour(X, Y, rh, levels=[70, 80, 90], colors='green', linewidths=0.8, linestyles=':')
+                        ax.clabel(cs_rh, inline=True, fontsize=8, fmt='%d%%')
+                    except:
+                        pass
+            else:
+                style = "rh"
+
+        elif style == "cloud_total":
+            # Total cloud condensate (all hydrometeors)
+            cloud_total = data.get('cloud_total')
+            if cloud_total is not None:
+                # Apply terrain mask
+                if surface_pressure is not None:
+                    cloud_total = cloud_total.copy()
+                    for i in range(n_points):
+                        sp = surface_pressure[i]
+                        for lev_idx, plev in enumerate(pressure_levels):
+                            if plev > sp:
+                                cloud_total[lev_idx, i] = np.nan
+
+                ct_colors = ['#FFFFFF', '#E8E8F0', '#C0C0E0', '#8888CC', '#5050AA', '#303088', '#101066']
+                ct_cmap = mcolors.LinearSegmentedColormap.from_list('cloud_total', ct_colors, N=256)
+                ct_levels = np.linspace(0, 1.0, 11)  # 0 to 1.0 g/kg
+                cf = ax.contourf(X, Y, cloud_total, levels=ct_levels, cmap=ct_cmap, extend='max')
+                cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.9)
+                cbar.set_label('Total Condensate (g/kg)', fontsize=11)
+                shading_label = "Condensate(g/kg)"
+            else:
+                style = "rh"
+
+        elif style == "shear":
+            # Vertical wind shear (reds colormap)
+            shear = data.get('shear')
+            if shear is not None:
+                # Apply terrain mask
+                if surface_pressure is not None:
+                    shear = shear.copy()
+                    for i in range(n_points):
+                        sp = surface_pressure[i]
+                        for lev_idx, plev in enumerate(pressure_levels):
+                            if plev > sp:
+                                shear[lev_idx, i] = np.nan
+
+                shear_levels = np.linspace(0, 10, 11)
+                cf = ax.contourf(X, Y, shear, levels=shear_levels, cmap='OrRd', extend='max')
+                cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.9)
+                cbar.set_label('Vertical Wind Shear (10⁻³/s)', fontsize=11)
+                shading_label = "Shear(10⁻³/s)"
+            else:
+                style = "rh"
+
+        elif style == "wetbulb":
+            # Wet-bulb temperature (coolwarm with emphasis on 0°C)
+            wetbulb = data.get('wetbulb')
+            if wetbulb is not None:
+                # Apply terrain mask
+                if surface_pressure is not None:
+                    wetbulb = wetbulb.copy()
+                    for i in range(n_points):
+                        sp = surface_pressure[i]
+                        for lev_idx, plev in enumerate(pressure_levels):
+                            if plev > sp:
+                                wetbulb[lev_idx, i] = np.nan
+
+                wb_levels = np.arange(-30, 35, 5)
+                cf = ax.contourf(X, Y, wetbulb, levels=wb_levels, cmap='coolwarm', extend='both')
+                cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.9)
+                cbar.set_label('Wet-Bulb Temperature (°C)', fontsize=11)
+                shading_label = "Tw(°C)"
+
+                # Add wet-bulb 0°C line (critical for snow/rain transition)
+                try:
+                    cs_wb0 = ax.contour(X, Y, wetbulb, levels=[0], colors='lime', linewidths=2.5)
+                    ax.clabel(cs_wb0, inline=True, fontsize=9, fmt='Tw=0°C')
+                except:
+                    pass
+            else:
+                style = "rh"
+
+        elif style == "icing":
+            # Icing proxy (supercooled liquid water)
+            icing = data.get('icing')
+            if icing is not None:
+                # Apply terrain mask
+                if surface_pressure is not None:
+                    icing = icing.copy()
+                    for i in range(n_points):
+                        sp = surface_pressure[i]
+                        for lev_idx, plev in enumerate(pressure_levels):
+                            if plev > sp:
+                                icing[lev_idx, i] = np.nan
+
+                # Purple gradient for icing severity
+                icing_colors = ['#FFFFFF', '#E8D8F0', '#D0B0E0', '#B080D0', '#9050C0', '#7020B0', '#500090']
+                icing_cmap = mcolors.LinearSegmentedColormap.from_list('icing', icing_colors, N=256)
+                icing_levels = np.linspace(0, 0.3, 11)
+                cf = ax.contourf(X, Y, icing, levels=icing_levels, cmap=icing_cmap, extend='max')
+                cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.9)
+                cbar.set_label('SLW Icing Proxy (g/kg)', fontsize=11)
+                shading_label = "Icing(g/kg)"
+
+                # Add key temperature isotherms for icing context
+                temp_c = data.get('temp_c')
+                if temp_c is not None:
+                    for t_val, color in [(0, 'red'), (-10, 'orange'), (-20, 'yellow')]:
+                        try:
+                            cs_t = ax.contour(X, Y, temp_c, levels=[t_val], colors=color, linewidths=1.5, linestyles='--')
+                            ax.clabel(cs_t, inline=True, fontsize=8, fmt='%d°C')
+                        except:
+                            pass
+            else:
+                style = "rh"
+
+        elif style == "lapse_rate":
+            # Temperature lapse rate (diverging: blue=stable, red=unstable)
+            lapse = data.get('lapse_rate')
+            if lapse is not None:
+                # Apply terrain mask
+                if surface_pressure is not None:
+                    lapse = lapse.copy()
+                    for i in range(n_points):
+                        sp = surface_pressure[i]
+                        for lev_idx, plev in enumerate(pressure_levels):
+                            if plev > sp:
+                                lapse[lev_idx, i] = np.nan
+
+                # Diverging colormap: blue (stable < 6) -> white (neutral ~6-7) -> red (unstable > 7)
+                lapse_levels = np.arange(0, 12.5, 0.5)
+                cf = ax.contourf(X, Y, lapse, levels=lapse_levels, cmap='RdYlBu_r', extend='both')
+                cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.9)
+                cbar.set_label('Lapse Rate (°C/km)', fontsize=11)
+                shading_label = "Γ(°C/km)"
+
+                # Add reference lines for dry adiabatic (9.8) and moist adiabatic (~6)
+                try:
+                    ax.contour(X, Y, lapse, levels=[6.0], colors='green', linewidths=1.5, linestyles='-')
+                    ax.contour(X, Y, lapse, levels=[9.8], colors='red', linewidths=1.5, linestyles='-')
+                except:
+                    pass
+            else:
+                style = "rh"
+
         if style == "rh":
             # RH shading (brown=dry, green=moist)
             rh = data.get('rh', theta)
@@ -578,7 +932,11 @@ def create_production_cross_section(
         # Save (don't use tight_layout - conflicts with inset map)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        style_short = {'wind_speed': 'wspd', 'rh': 'rh', 'omega': 'omega', 'vorticity': 'vort', 'cloud': 'cloud'}.get(style, style)
+        style_short = {
+            'wind_speed': 'wspd', 'rh': 'rh', 'omega': 'omega', 'vorticity': 'vort', 'cloud': 'cloud',
+            'temp': 'temp', 'theta_e': 'thetae', 'q': 'q', 'cloud_total': 'cloudtot',
+            'shear': 'shear', 'wetbulb': 'wetbulb', 'icing': 'icing', 'lapse_rate': 'lapse',
+        }.get(style, style)
         output_path = output_dir / f"xsect_{style_short}_theta_f{forecast_hour:02d}.png"
         plt.savefig(output_path, dpi=dpi, facecolor='white')
         plt.close()
@@ -674,7 +1032,11 @@ def create_cross_section_animation(
             img = Image.open(fp)
             images.append(img)
 
-        style_short = {'wind_speed': 'wspd', 'rh': 'rh', 'omega': 'omega', 'vorticity': 'vort', 'cloud': 'cloud'}.get(style, style)
+        style_short = {
+            'wind_speed': 'wspd', 'rh': 'rh', 'omega': 'omega', 'vorticity': 'vort', 'cloud': 'cloud',
+            'temp': 'temp', 'theta_e': 'thetae', 'q': 'q', 'cloud_total': 'cloudtot',
+            'shear': 'shear', 'wetbulb': 'wetbulb', 'icing': 'icing', 'lapse_rate': 'lapse',
+        }.get(style, style)
         output_path = output_dir / f"xsect_{style_short}_{cycle}.gif"
         duration = 1000 // fps  # milliseconds per frame
 
