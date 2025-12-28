@@ -205,8 +205,8 @@ class CrossSectionManager:
 
             self.cycles[cycle_key] = cycle
 
-        # Sort by valid time
-        self.valid_times.sort(key=lambda x: x['valid_dt'])
+        # Sort by init time (newest first), then by forecast hour
+        self.valid_times.sort(key=lambda x: (-x['init_dt'].timestamp(), x['fhr']))
 
         logger.info(f"Loaded {total_loaded} forecast hours across {len(cycles)} cycles")
         logger.info(f"Valid times: {[v['valid_str'] for v in self.valid_times]}")
@@ -464,14 +464,33 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 hourSelect.innerHTML = '';
 
                 if (availableTimes.length > 0) {
-                    // New multi-cycle mode: show valid times
+                    // Group by init cycle, show forecast hours
+                    let lastInit = '';
                     availableTimes.forEach((t, idx) => {
                         const opt = document.createElement('option');
-                        opt.value = idx;  // Use index as value
-                        // Show: "Valid 2025-12-28 18Z (F06 from 12Z)"
-                        const validShort = t.valid.split(' ')[1];  // Just the time part
-                        const initShort = t.init.split(' ')[1];
-                        opt.textContent = `${validShort} (F${String(t.fhr).padStart(2,'0')} ${initShort})`;
+                        opt.value = idx;
+
+                        // Format: "Dec 28 18Z - F00" or just "F06" if same init
+                        const initParts = t.init.split(' ');  // ["2025-12-28", "18Z"]
+                        const datePart = initParts[0];  // "2025-12-28"
+                        const timePart = initParts[1];  // "18Z"
+
+                        // Convert date to shorter format
+                        const d = new Date(datePart);
+                        const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                        const shortDate = `${months[d.getMonth()]} ${d.getDate()}`;
+
+                        const initKey = `${shortDate} ${timePart}`;
+                        const fhrStr = `F${String(t.fhr).padStart(2,'0')}`;
+
+                        if (initKey !== lastInit) {
+                            // New init cycle - show full label
+                            opt.textContent = `${shortDate} ${timePart} - ${fhrStr}`;
+                            lastInit = initKey;
+                        } else {
+                            // Same init - just show forecast hour indented
+                            opt.textContent = `    ${fhrStr}`;
+                        }
                         hourSelect.appendChild(opt);
                     });
                 } else {
@@ -488,12 +507,63 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 // Show cycle info
                 if (data.cycles && data.cycles.length > 0) {
                     document.getElementById('cycle-info').textContent =
-                        `Cycles: ${data.cycles.join(', ')}`;
+                        `Loaded: ${data.cycles.join(', ')}`;
                 } else if (data.cycle) {
                     document.getElementById('cycle-info').textContent =
                         `${data.cycle.model.toUpperCase()} ${data.cycle.date} ${data.cycle.hour}Z`;
                 }
             });
+
+        // Auto-refresh: check for new data every 5 minutes
+        let lastTimeCount = 0;
+        function checkForUpdates() {
+            fetch('/api/info')
+                .then(r => r.json())
+                .then(data => {
+                    const newTimes = data.times || [];
+                    if (newTimes.length !== lastTimeCount) {
+                        lastTimeCount = newTimes.length;
+                        // Refresh the dropdown
+                        availableTimes = newTimes;
+                        const hourSelect = document.getElementById('hour-select');
+                        const currentVal = hourSelect.value;
+                        hourSelect.innerHTML = '';
+
+                        let lastInit = '';
+                        newTimes.forEach((t, idx) => {
+                            const opt = document.createElement('option');
+                            opt.value = idx;
+                            const initParts = t.init.split(' ');
+                            const datePart = initParts[0];
+                            const timePart = initParts[1];
+                            const d = new Date(datePart);
+                            const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                            const shortDate = `${months[d.getMonth()]} ${d.getDate()}`;
+                            const initKey = `${shortDate} ${timePart}`;
+                            const fhrStr = `F${String(t.fhr).padStart(2,'0')}`;
+
+                            if (initKey !== lastInit) {
+                                opt.textContent = `${shortDate} ${timePart} - ${fhrStr}`;
+                                lastInit = initKey;
+                            } else {
+                                opt.textContent = `    ${fhrStr}`;
+                            }
+                            hourSelect.appendChild(opt);
+                        });
+
+                        // Try to restore selection or select first
+                        hourSelect.value = currentVal < newTimes.length ? currentVal : 0;
+
+                        // Update cycle info
+                        if (data.cycles && data.cycles.length > 0) {
+                            document.getElementById('cycle-info').textContent =
+                                `Loaded: ${data.cycles.join(', ')} (updated)`;
+                        }
+                    }
+                })
+                .catch(() => {});  // Silently ignore refresh errors
+        }
+        setInterval(checkForUpdates, 5 * 60 * 1000);  // Every 5 minutes
 
         // Map click handler
         map.on('click', e => {
