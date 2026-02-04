@@ -35,13 +35,27 @@ cloudflared tunnel --url http://localhost:5559
 ### Interactive Web Dashboard
 - **Leaflet map** with click-to-place markers and draggable endpoints
 - **14 visualization styles** via dropdown with community voting
-- **19 forecast hours** (F00-F18) shown as selectable chips
+- **19 forecast hours** (F00-F18) with color-coded chip system:
+  - **Grey** = downloaded, not loaded (click to load, ~15s)
+  - **Green** = loaded in RAM (click for instant view)
+  - **Blue** = currently viewing
+  - **Yellow pulse** = loading in progress
+  - **Shift+click** to unload (prevents accidental unloads)
 - **Model run picker** grouped by date with `<optgroup>`, shows load status and FHR count
 - **Height/pressure toggle** - view Y-axis as hPa or km
 - **Vertical scaling** - 1x, 1.5x, 2x exaggeration
 - **Vertical range selector** - full atmosphere (100 hPa), mid (300), low (500), boundary layer (700)
+- **Distance units toggle** - km or miles
 - **Community favorites** - save/load cross-section configs by name, auto-expire after 12h
 - **Feature request system** - users can submit and vote on feature ideas
+
+### Plot Annotations
+- **A/B endpoint labels** on the cross-section and inset map
+- **City/location labels** along the x-axis (~100+ US cities, 120km search radius, deduplicated)
+- **Lat/lon coordinates** on a secondary x-axis below the main plot
+- **Legend box** with color-coded entries for theta, freezing level, and terrain
+- **Inset map** with matplotlib (no external tile dependency) showing the cross-section path with A/B badges
+- **Credit text** with research collaborative attribution
 
 ### Continuous Auto-Updating
 - **Progressive download daemon** (`auto_update.py`) checks every 2 minutes
@@ -51,21 +65,22 @@ cloudflared tunnel --url http://localhost:5559
 - **Parallel loading** with 4 worker threads for faster data loading
 
 ### Memory Management
-- **117 GB RAM hard cap** with LRU eviction starting at 115 GB
-- **Latest 2 cycles pre-loaded** in background at startup for instant access
+- **Even FHR preloading** - latest 2 cycles pre-loaded with even forecast hours only (F00, F02, ..., F18) to balance RAM usage (~53 GB) vs coverage
+- **LRU eviction** starting at 115 GB, hard cap at 117 GB
 - Unique engine key mapping allows multiple init cycles loaded simultaneously
+- Odd forecast hours load on-demand when requested
 
-### Disk Storage (500 GB)
-- **Space-based eviction** instead of age-based - popular data persists
+### Disk Storage
+- **NPZ cache** with configurable limit (default 400 GB) - separate from GRIB storage
+- **GRIB disk limit** of 500 GB with space-based eviction
 - **Popularity tracking** via `data/disk_meta.json` (last accessed time + access count)
 - Protected cycles: latest 2 auto-update targets + anything accessed in last 2 hours
 - Disk usage checked every 10 minutes, evicts least-recently-accessed first
-- User-requested dates stay on disk as long as there's space
 
 ### Custom Date Requests
-- **Request button** lets users download F00-F18 for any date/init cycle
-- Downloads from NOMADS (recent) or AWS archive (older data)
-- Progress polling shows download status in real-time
+- **Calendar button** lets users download F00-F18 for any date/init cycle
+- Downloads from NOMADS (recent, <48h) or AWS archive (older data)
+- **Live progress toast** showing download count (e.g., "7/19 FHRs") with progress bar, polls every 10s
 
 ### Performance
 - **Sub-second generation** after data is loaded (~0.3s typical)
@@ -112,10 +127,13 @@ cloudflared tunnel --url http://localhost:5559
 - **Wind barbs** with actual U and V components
 - **Freezing level** (magenta line) - 0°C isotherm
 - **Terrain fill** (brown) - contourf fills entire grid, terrain covers underground (standard met practice)
+- **Legend box** identifying overlays
+- **A/B endpoint markers** on plot and inset map
+- **City labels** with lat/lon and distance along path
 
 ### Temperature Colormap
 Uses the NWS NDFD color table with 0°C (freezing) = yellow:
-- Purple (-60°C) → Blue (-30°C) → Cyan (-10°C) → **Yellow (0°C)** → Orange (20°C) → Red (40°C)
+- Purple (-60°C) -> Blue (-30°C) -> Cyan (-10°C) -> **Yellow (0°C)** -> Orange (20°C) -> Red (40°C)
 
 ## API Endpoints
 
@@ -124,6 +142,7 @@ Uses the NWS NDFD color table with 0°C (freezing) = yellow:
 | `/` | GET | Dashboard UI |
 | `/api/cycles` | GET | List available cycles (grouped by date) |
 | `/api/status` | GET | Memory/load status |
+| `/api/progress` | GET | Loading progress for UI progress bar |
 | `/api/load` | POST | Load specific cycle + forecast hour |
 | `/api/load_cycle` | POST | Load entire cycle (all FHRs) |
 | `/api/unload` | POST | Unload a forecast hour |
@@ -138,8 +157,18 @@ Uses the NWS NDFD color table with 0°C (freezing) = yellow:
 ### Generate Cross-Section via API
 
 ```
-GET /api/xsect?start_lat=40.0&start_lon=-100.0&end_lat=35.0&end_lon=-90.0&style=frontogenesis&cycle=20260204_04z&fhr=6&y_axis=pressure&vscale=1.5&y_top=300
+GET /api/xsect?start_lat=40.0&start_lon=-100.0&end_lat=35.0&end_lon=-90.0&style=frontogenesis&cycle=20260204_04z&fhr=6&y_axis=pressure&vscale=1.5&y_top=300&units=km
 ```
+
+Parameters:
+- `start_lat`, `start_lon`, `end_lat`, `end_lon` - Cross-section endpoints
+- `style` - Visualization style (see table above)
+- `cycle` - Init cycle key (e.g., `20260204_04z`)
+- `fhr` - Forecast hour (0-18)
+- `y_axis` - `pressure` (hPa) or `height` (km)
+- `vscale` - Vertical exaggeration (1.0, 1.5, 2.0)
+- `y_top` - Top of plot in hPa (100, 200, 300, 500, 700)
+- `units` - Distance axis units (`km` or `mi`)
 
 ## Architecture
 
@@ -148,8 +177,9 @@ tools/
 ├── unified_dashboard.py      # Flask server + Leaflet UI + data management
 │   ├── CrossSectionManager   # Handles loading, eviction, engine key mapping
 │   ├── Memory management     # 117GB cap, LRU eviction at 115GB
-│   ├── Disk management       # 500GB cap, popularity-based eviction
+│   ├── Disk management       # 500GB GRIB + 400GB NPZ cache limits
 │   ├── Community favorites   # Save/load/delete with 12h expiry
+│   ├── FHR chip system       # Color-coded load states, shift+click unload
 │   └── Thread-safe parallel loading
 │
 └── auto_update.py            # Continuous download daemon
@@ -159,31 +189,40 @@ tools/
 core/
 ├── cross_section_interactive.py  # Fast interactive engine
 │   ├── Pre-loads 3D fields into RAM
-│   ├── NPZ caching layer
+│   ├── NPZ caching layer (400GB limit with eviction)
 │   ├── <1s cross-section generation
+│   ├── City label proximity matching (120km radius)
+│   ├── A/B endpoint labels and legend
+│   ├── km/mi unit conversion at render time
 │   ├── Progress callback for field-level tracking
 │   └── NWS NDFD temperature colormap
 │
 └── cross_section_production.py   # Batch processing
 
+smart_hrrr/
+├── orchestrator.py    # Parallel GRIB download coordination
+├── availability.py    # Check NOMADS/AWS for available cycles
+├── io.py              # Output directory structure
+└── utils.py           # Shared utilities
+
 data/
-├── favorites.json            # Community favorites
-├── votes.json                # Style votes
-├── requests.json             # Feature requests
-└── disk_meta.json            # Disk usage tracking (access times, counts)
+├── favorites.json     # Community favorites
+├── votes.json         # Style votes
+├── requests.json      # Feature requests
+└── disk_meta.json     # Disk usage tracking (access times, counts)
 ```
 
 ## Memory Usage
 
 | Loaded | RAM Usage |
 |--------|-----------|
-| 1 forecast hour | ~700 MB |
-| 1 full cycle (F00-F18) | ~13 GB |
-| 2 full cycles (preloaded) | ~26 GB |
+| 1 forecast hour | ~3.5 GB |
+| Even FHRs, 1 cycle (F00,F02,...,F18) | ~27 GB |
+| Even FHRs, 2 cycles (preloaded) | ~53 GB |
 | Max before eviction | 115 GB |
 | Hard cap | 117 GB |
 
-The dashboard uses LRU eviction - when memory hits 115 GB, the oldest loaded items are evicted first.
+The dashboard pre-loads even forecast hours from the latest 2 cycles at startup. Odd hours load on-demand (~15s from NPZ cache). LRU eviction kicks in at 115 GB.
 
 ## Command Line Options
 
@@ -194,7 +233,6 @@ python tools/unified_dashboard.py [OPTIONS]
 --port PORT          Server port (default: 5559)
 --host HOST          Server host (default: 0.0.0.0)
 --preload N          Cycles to pre-load at startup (default: 0)
---n-cycles N         Max cycles to scan for (default: 30)
 --production         Enable rate limiting
 --auto-update        Download latest data before starting
 --max-hours N        Max forecast hour to download
@@ -222,7 +260,11 @@ outputs/hrrr/{YYYYMMDD}/{HH}z/F{XX}/
 
 Required fields: Temperature, U/V wind, RH, geopotential height, specific humidity, vorticity, cloud water, dew point on isobaric levels. Surface pressure from surface file for terrain.
 
-Data is automatically downloaded from NOAA NOMADS (recent, <48h) or AWS archive (older) by the auto-update daemon or on-demand via the request button.
+Data is automatically downloaded from NOAA NOMADS (recent, <48h) or AWS archive (older) by the auto-update daemon or on-demand via the calendar request button.
+
+## Credits
+
+Contributors: @jasonbweather, Sequoiagrove & others
 
 ## Dependencies
 

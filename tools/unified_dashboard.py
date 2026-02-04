@@ -630,7 +630,7 @@ class CrossSectionManager:
             'memory_mb': round(mem_mb, 0),
         }
 
-    def generate_cross_section(self, start, end, cycle_key, fhr, style, y_axis='pressure', vscale=1.0, y_top=100):
+    def generate_cross_section(self, start, end, cycle_key, fhr, style, y_axis='pressure', vscale=1.0, y_top=100, units='km'):
         """Generate a cross-section for a loaded forecast hour."""
         if not self.xsect:
             return None
@@ -660,7 +660,8 @@ class CrossSectionManager:
                 dpi=100,
                 y_axis=y_axis,
                 vscale=vscale,
-                y_top=y_top
+                y_top=y_top,
+                units=units
             )
             if png_bytes is None:
                 return None
@@ -774,10 +775,20 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             user-select: none;
         }
         .chip:hover { border-color: var(--accent); color: var(--text); }
-        .chip.selected {
+        /* Downloaded but not loaded - default look, click will trigger load */
+        /* Loaded in RAM, ready for instant view */
+        .chip.loaded {
+            background: rgba(76, 175, 80, 0.15);
+            color: #4caf50;
+            border-color: #4caf50;
+        }
+        .chip.loaded:hover { background: rgba(76, 175, 80, 0.3); }
+        /* Currently viewing this FHR */
+        .chip.active {
             background: var(--accent);
             color: #000;
             border-color: var(--accent);
+            font-weight: 700;
         }
         .chip.loading {
             background: var(--warning);
@@ -788,6 +799,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .chip:disabled, .chip.unavailable {
             opacity: 0.4;
             cursor: not-allowed;
+        }
+        /* Shift+click unload hint */
+        .chip.loaded:active, .chip.active:active {
+            opacity: 0.7;
         }
 
         /* Toggle button group */
@@ -858,6 +873,73 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             height: 100%;
             background: var(--accent);
             transition: width 0.3s ease;
+        }
+
+        /* RAM status modal */
+        #memory-status { cursor: pointer; }
+        #memory-status:hover { color: var(--text); }
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6);
+            z-index: 10000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-overlay.visible { display: flex; }
+        .modal {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            min-width: 360px;
+            max-width: 500px;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        }
+        .modal h3 {
+            margin: 0 0 12px 0;
+            font-size: 15px;
+            color: var(--text);
+        }
+        .modal .close-btn {
+            float: right;
+            background: none;
+            border: none;
+            color: var(--muted);
+            font-size: 18px;
+            cursor: pointer;
+            padding: 0 4px;
+        }
+        .modal .close-btn:hover { color: var(--text); }
+        .modal table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .modal th {
+            text-align: left;
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--border);
+            color: var(--muted);
+            font-weight: 600;
+        }
+        .modal td {
+            padding: 5px 8px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        .modal .cycle-group {
+            color: var(--accent);
+            font-weight: 600;
+        }
+        .modal .summary {
+            margin-top: 12px;
+            padding-top: 10px;
+            border-top: 1px solid var(--border);
+            font-size: 12px;
+            color: var(--muted);
         }
 
         /* Toast notifications */
@@ -1282,6 +1364,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <option value="700">700 hPa</option>
                     </select>
                 </div>
+                <div class="control-group">
+                    <label>Units:</label>
+                    <select id="units-select">
+                        <option value="km" selected>km</option>
+                        <option value="mi">mi</option>
+                    </select>
+                </div>
                 <div class="control-group favorites-group">
                     <select id="favorites-select">
                         <option value="">⭐ Favorites</option>
@@ -1353,6 +1442,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         </div>
     </div>
 
+    <div class="modal-overlay" id="ram-modal">
+        <div class="modal">
+            <button class="close-btn" id="ram-modal-close">&times;</button>
+            <h3>RAM Status</h3>
+            <div id="ram-modal-body"></div>
+        </div>
+    </div>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
         const styles = ''' + json.dumps(XSECT_STYLES) + ''';
@@ -1449,6 +1545,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // =========================================================================
         const ytopSelect = document.getElementById('ytop-select');
         ytopSelect.onchange = generateCrossSection;
+
+        // =========================================================================
+        // Units (km/mi) Selector
+        // =========================================================================
+        const unitsSelect = document.getElementById('units-select');
+        unitsSelect.onchange = generateCrossSection;
 
         // =========================================================================
         // Community Favorites
@@ -1587,7 +1689,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             if (hourStr === null) return;
             const hour = parseInt(hourStr);
             if (isNaN(hour) || hour < 0 || hour > 23) {
-                showToast('Invalid hour (0-23)', true);
+                showToast('Invalid hour (0-23)', 'error');
                 return;
             }
 
@@ -1597,24 +1699,44 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const data = await res.json();
                 toast.remove();
                 if (data.success) {
-                    showToast(data.message);
-                    // Poll for it to appear
+                    // Show persistent progress toast
+                    const progressToast = showToast(`📡 ${data.cycle_key}: downloading 0/19 FHRs from ${data.source}...`);
+                    let lastCount = 0;
+
                     const pollInterval = setInterval(async () => {
                         await refreshCycleList();
                         const found = cycles.find(c => c.key === data.cycle_key);
-                        if (found && found.fhrs.length >= 18) {
-                            clearInterval(pollInterval);
-                            showToast(`${data.cycle_key} ready! (${found.fhrs.length} FHRs)`);
+                        const count = found ? found.fhrs.length : 0;
+
+                        if (count !== lastCount) {
+                            lastCount = count;
+                            const pct = Math.round(count / 19 * 100);
+                            const bar = '█'.repeat(Math.round(pct / 5)) + '░'.repeat(20 - Math.round(pct / 5));
+                            progressToast.querySelector('span').textContent =
+                                `📡 ${data.cycle_key}: ${count}/19 FHRs [${bar}] ${pct}%`;
                         }
-                    }, 15000);
-                    // Stop polling after est + 5 min
-                    setTimeout(() => clearInterval(pollInterval), ((data.est_minutes || 10) + 5) * 60000);
+
+                        if (count >= 19) {
+                            clearInterval(pollInterval);
+                            progressToast.remove();
+                            showToast(`${data.cycle_key} ready! All 19 forecast hours downloaded.`, 'success');
+                        }
+                    }, 10000);
+
+                    // Stop polling after est + 10 min
+                    setTimeout(() => {
+                        clearInterval(pollInterval);
+                        if (lastCount < 19) {
+                            progressToast.remove();
+                            showToast(`${data.cycle_key}: ${lastCount}/19 FHRs downloaded (timed out polling, download may still be running)`, 'error');
+                        }
+                    }, ((data.est_minutes || 10) + 10) * 60000);
                 } else {
-                    showToast(data.error || 'Request failed', true);
+                    showToast(data.error || 'Request failed', 'error');
                 }
             } catch (e) {
                 toast.remove();
-                showToast('Request failed', true);
+                showToast('Request failed', 'error');
             }
         };
 
@@ -1685,18 +1807,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 if (cycles.length === 0) return;
 
                 currentCycle = cycles[0].key;
-                renderFhrChips(cycles[0].fhrs, cycles[0].loaded);
 
-                // Check what's already loaded
+                // Check what's already loaded, then render chips
                 await refreshLoadedStatus();
 
-                // If first cycle is loaded, auto-select first available FHR
-                if (cycles[0].loaded && cycles[0].fhrs.length > 0) {
-                    activeFhr = cycles[0].fhrs[0];
-                    selectedFhrs = cycles[0].fhrs.slice();
+                // If first cycle has loaded FHRs, auto-select first one
+                if (selectedFhrs.length > 0) {
+                    activeFhr = selectedFhrs[0];
                     document.getElementById('active-fhr').textContent = `F${String(activeFhr).padStart(2,'0')}`;
-                    renderFhrChips(cycles[0].fhrs, true);
                 }
+                renderFhrChips(cycles[0].fhrs);
             } catch (err) {
                 console.error('Failed to load cycles:', err);
             }
@@ -1722,12 +1842,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     const newFhrs = JSON.stringify(currentInfo.fhrs);
                     const oldFhrs = JSON.stringify(oldInfo.fhrs);
                     if (newFhrs !== oldFhrs) {
-                        renderFhrChips(currentInfo.fhrs, currentInfo.loaded);
-                        document.querySelectorAll('#fhr-chips .chip').forEach(chip => {
-                            const fhr = parseInt(chip.dataset.fhr);
-                            if (selectedFhrs.includes(fhr)) chip.classList.add('selected');
-                            if (fhr === activeFhr) chip.classList.add('selected');
-                        });
+                        renderFhrChips(currentInfo.fhrs);
                     }
                 }
 
@@ -1822,26 +1937,38 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 }
             }
 
-            // Render chips for loaded cycle
-            renderFhrChips(fhrs, true);
-            selectedFhrs = fhrs.slice();
+            // Update loaded state and render chips
+            await refreshLoadedStatus();
+            renderFhrChips(fhrs);
 
             // Auto-select first FHR
-            if (fhrs.length > 0) {
-                activeFhr = fhrs[0];
+            if (selectedFhrs.length > 0) {
+                activeFhr = selectedFhrs[0];
                 document.getElementById('active-fhr').textContent = `F${String(activeFhr).padStart(2,'0')}`;
+                updateChipStates();
                 generateCrossSection();
             }
         };
 
         // =========================================================================
-        // Forecast Hour Chips (Split & Chip Pattern)
+        // Forecast Hour Chips (Redesigned: clear states, no accidental unloads)
+        //
+        // Visual states:
+        //   - default (grey)  = downloaded on disk, not loaded to RAM
+        //   - .loaded (green) = loaded in RAM, click for instant view
+        //   - .active (blue)  = currently viewing this FHR
+        //   - .loading (yellow pulse) = loading in progress
+        //   - .unavailable (faded) = not downloaded yet
+        //
+        // Click behavior:
+        //   - Click loaded/active chip = instant view switch (no load time)
+        //   - Click unloaded chip = load to RAM (~15s), then view
+        //   - Shift+click loaded chip = unload from RAM (deliberate only)
         // =========================================================================
-        function renderFhrChips(availableFhrs, cycleLoaded = false) {
+        function renderFhrChips(availableFhrs) {
             const container = document.getElementById('fhr-chips');
             container.innerHTML = '';
 
-            // Show all forecast hours F00-F18
             const allFhrs = Array.from({length: 19}, (_, i) => i);
 
             allFhrs.forEach(fhr => {
@@ -1850,54 +1977,39 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 chip.textContent = `F${String(fhr).padStart(2, '0')}`;
                 chip.dataset.fhr = fhr;
 
-                // Mark unavailable
                 if (!availableFhrs.includes(fhr)) {
                     chip.classList.add('unavailable');
                     chip.title = 'Not downloaded yet';
-                } else if (cycleLoaded) {
-                    if (fhr === activeFhr) {
-                        chip.classList.add('selected');
-                    }
-                    chip.onclick = () => selectFhr(fhr, chip);
                 } else {
-                    if (selectedFhrs.includes(fhr)) {
-                        chip.classList.add('selected');
+                    // Set visual state based on loaded/active
+                    if (fhr === activeFhr) {
+                        chip.classList.add('active');
+                        chip.title = 'Currently viewing (Shift+click to unload)';
+                    } else if (selectedFhrs.includes(fhr)) {
+                        chip.classList.add('loaded');
+                        chip.title = 'Loaded in RAM — click for instant view (Shift+click to unload)';
+                    } else {
+                        chip.title = 'Click to load (~15s)';
                     }
-                    chip.onclick = () => toggleFhr(fhr, chip);
+                    chip.onclick = (e) => handleChipClick(fhr, chip, e);
                 }
 
                 container.appendChild(chip);
             });
         }
 
-        // For loaded cycles: just switch which FHR we're viewing
-        function selectFhr(fhr, chipEl) {
-            // Update active FHR
-            activeFhr = fhr;
-            document.getElementById('active-fhr').textContent = `F${String(fhr).padStart(2,'0')}`;
-
-            // Update chip visual state
-            document.querySelectorAll('#fhr-chips .chip').forEach(c => {
-                c.classList.remove('selected');
-            });
-            chipEl.classList.add('selected');
-
-            // Generate cross-section
-            generateCrossSection();
-        }
-
-        // For unloaded cycles: load/unload individual FHRs
-        async function toggleFhr(fhr, chipEl) {
+        // Unified click handler for all chips
+        async function handleChipClick(fhr, chipEl, event) {
             if (chipEl.classList.contains('loading') || chipEl.classList.contains('unavailable')) {
-                return;  // Ignore clicks while loading or unavailable
+                return;
             }
 
-            const isSelected = selectedFhrs.includes(fhr);
+            const isLoaded = selectedFhrs.includes(fhr);
 
-            if (isSelected) {
-                // === UNLOAD this forecast hour ===
+            // --- Shift+click = UNLOAD (deliberate action only) ---
+            if (event.shiftKey && isLoaded) {
                 chipEl.classList.add('loading');
-                chipEl.classList.remove('selected');
+                chipEl.classList.remove('loaded', 'active');
                 const toast = showToast(`Unloading F${String(fhr).padStart(2,'0')}...`);
 
                 try {
@@ -1910,10 +2022,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         showToast(`Unloaded F${String(fhr).padStart(2,'0')}`, 'success');
                         updateMemoryDisplay(data.memory_mb || 0);
 
-                        // If this was the active FHR, switch to another
                         if (activeFhr === fhr) {
                             activeFhr = selectedFhrs.length > 0 ? selectedFhrs[selectedFhrs.length - 1] : null;
                             if (activeFhr !== null) {
+                                document.getElementById('active-fhr').textContent = `F${String(activeFhr).padStart(2,'0')}`;
                                 generateCrossSection();
                             } else {
                                 document.getElementById('xsect-container').innerHTML =
@@ -1924,48 +2036,74 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     } else {
                         toast.remove();
                         showToast(data.error || 'Unload failed', 'error');
-                        chipEl.classList.add('selected');
                     }
                 } catch (err) {
                     toast.remove();
                     showToast('Unload failed', 'error');
-                    chipEl.classList.add('selected');
                 }
                 chipEl.classList.remove('loading');
-
-            } else {
-                // === LOAD this forecast hour ===
-                chipEl.classList.add('loading');
-                const toast = showToast(`Loading F${String(fhr).padStart(2,'0')}... (~15s)`);
-
-                try {
-                    const loadStart = Date.now();
-                    const res = await fetch(`/api/load?cycle=${currentCycle}&fhr=${fhr}`, {method: 'POST'});
-                    const data = await res.json();
-                    const loadSec = ((Date.now() - loadStart) / 1000).toFixed(1);
-
-                    if (data.success) {
-                        toast.remove();
-                        const serverTime = data.load_time ? `${data.load_time}s` : `${loadSec}s`;
-                        showToast(`Loaded F${String(fhr).padStart(2,'0')} in ${serverTime} (${Math.round(data.memory_mb || 0)} MB)`, 'success');
-
-                        // Update selected state based on what server says is loaded
-                        await refreshLoadedStatus();
-
-                        // Set this as active and generate cross-section
-                        activeFhr = fhr;
-                        document.getElementById('active-fhr').textContent = `F${String(fhr).padStart(2,'0')}`;
-                        generateCrossSection();
-                    } else {
-                        toast.remove();
-                        showToast(data.error || 'Load failed', 'error');
-                    }
-                } catch (err) {
-                    toast.remove();
-                    showToast('Load failed', 'error');
-                }
-                chipEl.classList.remove('loading');
+                updateChipStates();
+                return;
             }
+
+            // --- Normal click on loaded chip = INSTANT VIEW SWITCH ---
+            if (isLoaded) {
+                activeFhr = fhr;
+                document.getElementById('active-fhr').textContent = `F${String(fhr).padStart(2,'0')}`;
+                updateChipStates();
+                generateCrossSection();
+                return;
+            }
+
+            // --- Normal click on unloaded chip = LOAD then VIEW ---
+            chipEl.classList.add('loading');
+            const toast = showToast(`Loading F${String(fhr).padStart(2,'0')}... (~15s)`);
+
+            try {
+                const loadStart = Date.now();
+                const res = await fetch(`/api/load?cycle=${currentCycle}&fhr=${fhr}`, {method: 'POST'});
+                const data = await res.json();
+                const loadSec = ((Date.now() - loadStart) / 1000).toFixed(1);
+
+                if (data.success) {
+                    toast.remove();
+                    const serverTime = data.load_time ? `${data.load_time}s` : `${loadSec}s`;
+                    showToast(`Loaded F${String(fhr).padStart(2,'0')} in ${serverTime} (${Math.round(data.memory_mb || 0)} MB)`, 'success');
+
+                    await refreshLoadedStatus();
+
+                    activeFhr = fhr;
+                    document.getElementById('active-fhr').textContent = `F${String(fhr).padStart(2,'0')}`;
+                    generateCrossSection();
+                } else {
+                    toast.remove();
+                    showToast(data.error || 'Load failed', 'error');
+                }
+            } catch (err) {
+                toast.remove();
+                showToast('Load failed', 'error');
+            }
+            chipEl.classList.remove('loading');
+            updateChipStates();
+        }
+
+        // Update all chip visual states to match current data
+        function updateChipStates() {
+            document.querySelectorAll('#fhr-chips .chip').forEach(chip => {
+                const fhr = parseInt(chip.dataset.fhr);
+                if (chip.classList.contains('unavailable') || chip.classList.contains('loading')) return;
+
+                chip.classList.remove('loaded', 'active');
+                if (fhr === activeFhr) {
+                    chip.classList.add('active');
+                    chip.title = 'Currently viewing (Shift+click to unload)';
+                } else if (selectedFhrs.includes(fhr)) {
+                    chip.classList.add('loaded');
+                    chip.title = 'Loaded in RAM — click for instant view (Shift+click to unload)';
+                } else {
+                    chip.title = 'Click to load (~15s)';
+                }
+            });
         }
 
         async function refreshLoadedStatus() {
@@ -1981,15 +2119,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     }
                 });
 
-                // Update chip UI
-                document.querySelectorAll('#fhr-chips .chip').forEach(chip => {
-                    const fhr = parseInt(chip.dataset.fhr);
-                    if (selectedFhrs.includes(fhr)) {
-                        chip.classList.add('selected');
-                    } else {
-                        chip.classList.remove('selected');
-                    }
-                });
+                // Update chip UI with new state system
+                updateChipStates();
 
                 updateMemoryDisplay(data.memory_mb || 0);
             } catch (err) {
@@ -2062,9 +2193,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const vscale = document.getElementById('vscale-select').value;
             const ytop = document.getElementById('ytop-select').value;
 
+            const units = document.getElementById('units-select').value;
+
             const url = `/api/xsect?start_lat=${start.lat}&start_lon=${start.lng}` +
                 `&end_lat=${end.lat}&end_lon=${end.lng}&cycle=${currentCycle}&fhr=${activeFhr}&style=${style}` +
-                `&y_axis=${currentYAxis}&vscale=${vscale}&y_top=${ytop}`;
+                `&y_axis=${currentYAxis}&vscale=${vscale}&y_top=${ytop}&units=${units}`;
 
             try {
                 const res = await fetch(url);
@@ -2354,6 +2487,63 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // =========================================================================
         // Initialize
         // =========================================================================
+        // =========================================================================
+        // RAM Status Modal
+        // =========================================================================
+        const ramModal = document.getElementById('ram-modal');
+        const ramModalBody = document.getElementById('ram-modal-body');
+
+        document.getElementById('memory-status').onclick = async () => {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                const loaded = data.loaded || [];
+                const memMb = data.memory_mb || 0;
+
+                if (loaded.length === 0) {
+                    ramModalBody.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;">Nothing loaded in RAM</p>';
+                } else {
+                    // Group by cycle
+                    const groups = {};
+                    loaded.forEach(([cycle, fhr]) => {
+                        if (!groups[cycle]) groups[cycle] = [];
+                        groups[cycle].push(fhr);
+                    });
+
+                    let html = '<table><tr><th>Cycle</th><th>Forecast Hours</th><th>~RAM</th></tr>';
+                    const perFhr = loaded.length > 0 ? memMb / loaded.length : 0;
+
+                    Object.keys(groups).sort().reverse().forEach(cycle => {
+                        const fhrs = groups[cycle].sort((a,b) => a - b);
+                        const cycleMb = fhrs.length * perFhr;
+                        const fhrStr = fhrs.map(f => 'F' + String(f).padStart(2,'0')).join(', ');
+                        html += `<tr>
+                            <td class="cycle-group">${cycle}</td>
+                            <td>${fhrStr}</td>
+                            <td>${cycleMb >= 1000 ? (cycleMb/1000).toFixed(1) + ' GB' : Math.round(cycleMb) + ' MB'}</td>
+                        </tr>`;
+                    });
+
+                    html += '</table>';
+                    html += `<div class="summary">
+                        <strong>${loaded.length}</strong> forecast hours loaded &bull;
+                        <strong>${memMb >= 1000 ? (memMb/1000).toFixed(1) + ' GB' : Math.round(memMb) + ' MB'}</strong> total RAM &bull;
+                        <strong>117 GB</strong> cap
+                    </div>`;
+                    ramModalBody.innerHTML = html;
+                }
+
+                ramModal.classList.add('visible');
+            } catch (e) {
+                showToast('Failed to fetch RAM status', 'error');
+            }
+        };
+
+        ramModal.onclick = (e) => {
+            if (e.target === ramModal) ramModal.classList.remove('visible');
+        };
+        document.getElementById('ram-modal-close').onclick = () => ramModal.classList.remove('visible');
+
         loadCycles();
     </script>
 </body>
@@ -2459,6 +2649,7 @@ def api_xsect():
         y_axis = request.args.get('y_axis', 'pressure')  # 'pressure' or 'height'
         vscale = float(request.args.get('vscale', 1.0))  # vertical exaggeration
         y_top = int(request.args.get('y_top', 100))  # top of plot in hPa
+        dist_units = request.args.get('units', 'km')  # 'km' or 'mi'
     except (KeyError, ValueError) as e:
         return jsonify({'error': f'Invalid parameters: {e}'}), 400
 
@@ -2472,7 +2663,9 @@ def api_xsect():
     if y_top not in (100, 200, 300, 500, 700):
         y_top = 100  # Default to full atmosphere
 
-    buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top)
+    if dist_units not in ('km', 'mi'):
+        dist_units = 'km'
+    buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units)
     if buf is None:
         return jsonify({'error': 'Failed to generate cross-section. Data may not be loaded.'}), 500
 

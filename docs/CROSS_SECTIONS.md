@@ -100,8 +100,12 @@ All styles include:
 - **Theta contours** (black lines, every 4K) - shows atmospheric stability
 - **Wind barbs** - rotated to cross-section orientation
 - **Freezing level** (magenta line) - 0°C isotherm
-- **Terrain masking** - grays out below-ground areas
-- **Inset map** - shows cross-section path on terrain background
+- **Terrain fill** (brown) - contourf fills grid, terrain covers underground
+- **Inset map** - matplotlib-based with A/B endpoint badges
+- **Legend box** - identifies theta lines, freezing level, and terrain
+- **A/B endpoint labels** - on plot and inset map
+- **City/location labels** - nearest cities along path with lat/lon and distance
+- **Distance units** - km or miles (toggle in dashboard)
 
 ## Implementation Details
 
@@ -261,15 +265,19 @@ cmap = mcolors.LinearSegmentedColormap.from_list('wspd', colors)
 
 ### 5. Matplotlib Layout with Inset Maps
 
-**Problem:** `tight_layout()` conflicts with manually positioned inset axes.
+**Problem:** `tight_layout()` conflicts with manually positioned inset axes. `plt.colorbar(ax=ax)` steals space from the axes.
 
-**Solution:** Manually position all axes:
+**Solution:** Manually position all axes and colorbar:
 ```python
-fig, ax = plt.subplots(figsize=(14, 8.5))
-ax.set_position([0.08, 0.08, 0.85, 0.72])  # Main plot
+fig, ax = plt.subplots(figsize=(17, 11))
+ax.set_position([0.06, 0.12, 0.82, 0.68])  # Main plot
 
-# Inset map positioned above
-axins = fig.add_axes([0.08, 0.82, 0.25, 0.16], projection=ccrs.PlateCarree())
+# Colorbar as separate axes (doesn't steal space)
+cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
+plt.colorbar(cf, cax=cbar_ax)
+
+# Inset map positioned in top-right
+axins = fig.add_axes([x, y, w, h])
 ```
 
 ### 6. Pressure Level Handling
@@ -321,13 +329,18 @@ imageio  # For GIF animation
 Pillow   # For GIF optimization
 ```
 
-## Future Improvements
+## Implemented Improvements
 
-1. **Parallel processing** - Process multiple forecast hours concurrently
-2. **Height coordinates** - Option to display in meters/feet instead of pressure
-3. **Interactive cross-sections** - Web-based tool to draw paths on map
-4. **Additional fields** - CAPE, CIN, equivalent potential temperature (theta-e)
-5. **Smoother terrain** - Use actual topography instead of surface pressure
+1. **Parallel processing** - Thread-safe parallel loading with 4 worker threads
+2. **Height coordinates** - Toggle between pressure (hPa) and height (km) Y-axis
+3. **Interactive cross-sections** - Full web dashboard with Leaflet map, draggable markers
+4. **Additional fields** - theta-e, frontogenesis, wet-bulb, icing, lapse rate, shear (14 styles total)
+5. **City labels** - ~100+ US cities shown along cross-section path with proximity matching
+6. **Distance units** - km/mi toggle for distance axis
+7. **A/B endpoint markers** - on plot and inset map
+8. **NPZ caching** - 400GB cache with automatic eviction for fast reloads
+9. **Even FHR preloading** - RAM-optimized strategy loading only even forecast hours
+10. **Color-coded chip system** - clear visual states for loaded/viewing/loading FHRs
 
 ## References
 

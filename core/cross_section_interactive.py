@@ -648,6 +648,7 @@ class InteractiveCrossSection:
         y_axis: str = "pressure",
         vscale: float = 1.0,
         y_top: int = 100,
+        units: str = "km",
     ) -> Optional[bytes]:
         """Generate cross-section from pre-loaded data.
 
@@ -664,6 +665,7 @@ class InteractiveCrossSection:
             y_axis: 'pressure' (hPa) or 'height' (km)
             vscale: Vertical exaggeration factor (1.0 = normal, 2.0 = 2x taller)
             y_top: Top of plot in hPa (100=full atmos, 300=mid, 500=low, 700=boundary layer)
+            units: 'km' or 'mi' for distance axis
 
         Returns:
             PNG image bytes, or data dict if return_image=False
@@ -701,7 +703,7 @@ class InteractiveCrossSection:
         self._real_forecast_hour = None  # Reset after use
 
         # Render
-        img_bytes = self._render_cross_section(data, style, dpi, metadata, y_axis, vscale, y_top)
+        img_bytes = self._render_cross_section(data, style, dpi, metadata, y_axis, vscale, y_top, units=units)
 
         t_total = time.time() - start
         print(f"Cross-section generated in {t_total:.3f}s (interp: {t_interp:.3f}s)")
@@ -964,7 +966,8 @@ class InteractiveCrossSection:
         return np.array(distances)
 
     def _render_cross_section(self, data: Dict, style: str, dpi: int, metadata: Dict = None,
-                               y_axis: str = "pressure", vscale: float = 1.0, y_top: int = 100) -> bytes:
+                               y_axis: str = "pressure", vscale: float = 1.0, y_top: int = 100,
+                               units: str = "km") -> bytes:
         """Render cross-section to PNG bytes.
 
         Args:
@@ -975,6 +978,7 @@ class InteractiveCrossSection:
             y_axis: 'pressure' (hPa) or 'height' (km)
             vscale: Vertical exaggeration (1.0 = normal)
             y_top: Top of plot in hPa (100, 300, 500, or 700)
+            units: 'km' or 'mi' for distance axis
         """
         import matplotlib
         matplotlib.use('Agg')
@@ -983,7 +987,12 @@ class InteractiveCrossSection:
         from matplotlib.ticker import MultipleLocator
         from datetime import datetime, timedelta
 
-        distances = data['distances']
+        KM_TO_MI = 0.621371
+        use_miles = (units == 'mi')
+        dist_scale = KM_TO_MI if use_miles else 1.0
+        dist_unit = 'mi' if use_miles else 'km'
+
+        distances = data['distances'] * dist_scale
         pressure_levels = data['pressure_levels']
         theta = data.get('theta')
         temperature = data.get('temperature')
@@ -1406,7 +1415,7 @@ class InteractiveCrossSection:
 
         # Axes - configure based on y_axis choice
         ax.set_xlim(0, distances[-1])
-        ax.set_xlabel('Distance (km)', fontsize=11)
+        ax.set_xlabel(f'Distance ({dist_unit})', fontsize=11)
 
         if use_height:
             # Height axis: 0 at bottom, increasing upward
@@ -1526,7 +1535,7 @@ class InteractiveCrossSection:
             if best_city:
                 label += f"\n{best_city}"
                 used_cities.add(best_city)
-            label += f"\n{d:.0f} km"
+            label += f"\n{d:.0f} {dist_unit}"
             tick_positions.append(d)
             tick_labels.append(label)
 
@@ -1604,7 +1613,7 @@ class InteractiveCrossSection:
             pass  # Skip inset if cartopy fails
 
         # Add credit
-        fig.text(0.5, 0.005, 'CA Wildfire Tracking Research Collaborative  •  Mesoscale Analysis Division\nContributors: Sequoiagrove & others',
+        fig.text(0.5, 0.005, 'Contributors: @jasonbweather, Sequoiagrove & others',
                  ha='center', va='bottom', fontsize=8, color='#888888',
                  transform=fig.transFigure, style='italic', fontweight='bold')
 
