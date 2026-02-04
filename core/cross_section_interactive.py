@@ -259,19 +259,23 @@ class InteractiveCrossSection:
             print(f"Error loading from cache: {e}")
             return None
 
-    def load_forecast_hour(self, grib_file: str, forecast_hour: int) -> bool:
+    def load_forecast_hour(self, grib_file: str, forecast_hour: int, progress_callback=None) -> bool:
         """Load all fields for a forecast hour into memory.
 
         Args:
             grib_file: Path to wrfprs GRIB2 file
             forecast_hour: Forecast hour number
+            progress_callback: Optional callback(step, total, detail) for progress reporting
 
         Returns:
             True if successful
         """
+        cb = progress_callback or (lambda s, t, d: None)
+
         # Check cache first
         cache_path = self._get_cache_path(grib_file)
         if cache_path and cache_path.exists():
+            cb(1, 2, "Loading from cache...")
             print(f"Loading F{forecast_hour:02d} from cache...")
             start = time.time()
             fhr_data = self._load_from_cache(cache_path)
@@ -279,7 +283,16 @@ class InteractiveCrossSection:
                 self.forecast_hours[forecast_hour] = fhr_data
                 duration = time.time() - start
                 print(f"  Loaded F{forecast_hour:02d} from cache in {duration:.1f}s ({fhr_data.memory_usage_mb():.0f} MB)")
+                cb(2, 2, "Done")
                 return True
+
+        # Field names for progress reporting
+        field_labels = {
+            't': 'Temperature', 'u': 'U-Wind', 'v': 'V-Wind', 'r': 'RH',
+            'w': 'Omega', 'q': 'Sp. Humidity', 'gh': 'Geopotential',
+            'absv': 'Vorticity', 'clwmr': 'Cloud Water', 'dpt': 'Dew Point',
+        }
+        total_steps = 12  # 10 fields + surface pressure + derived
 
         try:
             import cfgrib
@@ -292,6 +305,7 @@ class InteractiveCrossSection:
                 warnings.simplefilter("ignore")
 
                 # First, get grid info and pressure levels from temperature
+                cb(1, total_steps, "Reading Temperature...")
                 ds_t = cfgrib.open_dataset(
                     grib_file,
                     filter_by_keys={'typeOfLevel': 'isobaricInhPa', 'shortName': 't'},
@@ -330,10 +344,12 @@ class InteractiveCrossSection:
                 ds_t.close()
 
                 # Load all other fields
+                step = 2
                 for grib_key, field_name in self.FIELDS_TO_LOAD.items():
                     if grib_key == 't':
                         continue  # Already loaded
 
+                    cb(step, total_steps, f"Reading {field_labels.get(grib_key, field_name)}...")
                     try:
                         ds = cfgrib.open_dataset(
                             grib_file,
@@ -346,8 +362,10 @@ class InteractiveCrossSection:
                         ds.close()
                     except Exception as e:
                         print(f"  Warning: Could not load {grib_key}: {e}")
+                    step += 1
 
                 # Load surface pressure
+                cb(11, total_steps, "Reading Surface Pressure...")
                 try:
                     # Try wrfsfc file first
                     sfc_file = Path(grib_file).parent / Path(grib_file).name.replace('wrfprs', 'wrfsfc')
@@ -372,6 +390,7 @@ class InteractiveCrossSection:
                     print(f"  Warning: Could not load surface pressure: {e}")
 
                 # Pre-compute theta and temp_c
+                cb(12, total_steps, "Computing derived fields...")
                 if fhr_data.temperature is not None:
                     P_ref = 1000.0
                     kappa = 0.286
@@ -600,6 +619,9 @@ class InteractiveCrossSection:
         n_points: int = 100,
         return_image: bool = True,
         dpi: int = 100,
+        y_axis: str = "pressure",
+        vscale: float = 1.0,
+        y_top: int = 100,
     ) -> Optional[bytes]:
         """Generate cross-section from pre-loaded data.
 
@@ -613,6 +635,9 @@ class InteractiveCrossSection:
             n_points: Points along path
             return_image: If True, return PNG bytes; if False, return data dict
             dpi: Output resolution
+            y_axis: 'pressure' (hPa) or 'height' (km)
+            vscale: Vertical exaggeration factor (1.0 = normal, 2.0 = 2x taller)
+            y_top: Top of plot in hPa (100=full atmos, 300=mid, 500=low, 700=boundary layer)
 
         Returns:
             PNG image bytes, or data dict if return_image=False
@@ -647,7 +672,7 @@ class InteractiveCrossSection:
         }
 
         # Render
-        img_bytes = self._render_cross_section(data, style, dpi, metadata)
+        img_bytes = self._render_cross_section(data, style, dpi, metadata, y_axis, vscale, y_top)
 
         t_total = time.time() - start
         print(f"Cross-section generated in {t_total:.3f}s (interp: {t_interp:.3f}s)")
@@ -735,6 +760,31 @@ class InteractiveCrossSection:
         if fhr_data.surface_pressure is not None:
             result['surface_pressure'] = interp_2d(fhr_data.surface_pressure)
 
+            # Extract terrain with enough points for smooth visualization
+            # Use bilinear interpolation between HRRR's 3km grid points
+            total_dist_km = result['distances'][-1]
+            # ~1.5km spacing gives smoother terrain while still following HRRR data
+            terrain_res = max(100, int(total_dist_km / 1.5))
+            path_lats_hires = np.linspace(path_lats[0], path_lats[-1], terrain_res)
+            path_lons_hires = np.linspace(path_lons[0], path_lons[-1], terrain_res)
+
+            if lats_grid.ndim == 2:
+                # Curvilinear - use same tree
+                tgt_pts_hires = np.column_stack([path_lats_hires, path_lons_hires])
+                _, indices_hires = tree.query(tgt_pts_hires, k=1)
+                sp_hires = fhr_data.surface_pressure.ravel()[indices_hires]
+            else:
+                # Regular grid - bilinear interpolation
+                pts_hires = np.column_stack([path_lats_hires, path_lons_hires])
+                interp_sp = RegularGridInterpolator(
+                    (lats_1d, lons_1d), fhr_data.surface_pressure,
+                    method='linear', bounds_error=False, fill_value=np.nan
+                )
+                sp_hires = interp_sp(pts_hires)
+
+            result['surface_pressure_hires'] = sp_hires
+            result['distances_hires'] = self._calculate_distances(path_lats_hires, path_lons_hires)
+
         # Style-specific fields
         if style in ['rh', 'q'] and fhr_data.rh is not None:
             result['rh'] = interp_3d(fhr_data.rh)
@@ -764,7 +814,8 @@ class InteractiveCrossSection:
         if style == 'q' and fhr_data.specific_humidity is not None:
             result['specific_humidity'] = interp_3d(fhr_data.specific_humidity)
 
-        if style in ['shear', 'lapse_rate'] and fhr_data.geopotential_height is not None:
+        # Always extract geopotential_height for height-axis display option
+        if fhr_data.geopotential_height is not None:
             gh = interp_3d(fhr_data.geopotential_height)
             result['geopotential_height'] = gh
 
@@ -883,8 +934,19 @@ class InteractiveCrossSection:
             distances.append(distances[-1] + R * c)
         return np.array(distances)
 
-    def _render_cross_section(self, data: Dict, style: str, dpi: int, metadata: Dict = None) -> bytes:
-        """Render cross-section to PNG bytes."""
+    def _render_cross_section(self, data: Dict, style: str, dpi: int, metadata: Dict = None,
+                               y_axis: str = "pressure", vscale: float = 1.0, y_top: int = 100) -> bytes:
+        """Render cross-section to PNG bytes.
+
+        Args:
+            data: Interpolated cross-section data
+            style: Visualization style
+            dpi: Output resolution
+            metadata: Model run info for labels
+            y_axis: 'pressure' (hPa) or 'height' (km)
+            vscale: Vertical exaggeration (1.0 = normal)
+            y_top: Top of plot in hPa (100, 300, 500, or 700)
+        """
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
@@ -901,6 +963,7 @@ class InteractiveCrossSection:
         v_wind = data.get('v_wind')
         lats = data['lats']
         lons = data['lons']
+        geopotential_height = data.get('geopotential_height')
 
         # Parse metadata for labels
         metadata = metadata or {}
@@ -931,159 +994,194 @@ class InteractiveCrossSection:
         else:
             wind_speed = None
 
-        # Apply terrain masking
-        if surface_pressure is not None and theta is not None:
-            theta = theta.copy()
-            for i in range(n_points):
-                sp = surface_pressure[i]
-                for lev_idx, plev in enumerate(pressure_levels):
-                    if plev > sp:
-                        theta[lev_idx, i] = np.nan
-                        if wind_speed is not None:
-                            wind_speed[lev_idx, i] = np.nan
+        # NOTE: Terrain masking removed - let contourf fill entire grid
+        # The terrain fill (zorder=5) will cover underground portions
 
-        # Create figure
-        fig, ax = plt.subplots(figsize=(12, 7), facecolor='white')
-        X, Y = np.meshgrid(distances, pressure_levels)
+        # Create figure - extra height for inset map above plot
+        # Apply vertical scale factor to figure height
+        base_height = 9.5  # Taller for inset map space above
+        fig_height = base_height * min(max(vscale, 0.5), 3.0)  # Clamp between 0.5x and 3x
+        fig, ax = plt.subplots(figsize=(14, fig_height), facecolor='white')
+        ax.set_position([0.08, 0.07, 0.84, 0.73])  # Wide plot, room above for inset
+
+        # Determine Y coordinate based on y_axis choice
+        use_height = (y_axis == 'height' and geopotential_height is not None)
+
+        # Filter to vertical range (y_top sets the top of the plot in hPa)
+        # Pressure levels are ordered high-to-low (1000, 975, 950, ... 100)
+        # We want levels >= y_top (i.e., from surface up to y_top)
+        level_mask = pressure_levels >= y_top
+        pressure_levels_filtered = pressure_levels[level_mask]
+
+        # Helper to filter any 3D array to vertical range
+        def filter_levels(arr):
+            if arr is None:
+                return None
+            return arr[level_mask, :]
+
+        # Filter all 3D data arrays to the selected vertical range
+        theta = filter_levels(theta)
+        wind_speed = filter_levels(wind_speed)
+        u_wind = filter_levels(u_wind)
+        v_wind = filter_levels(v_wind)
+        geopotential_height = filter_levels(geopotential_height)
+
+        # Also filter style-specific arrays from data dict
+        for key in ['rh', 'omega', 'vorticity', 'cloud', 'temperature', 'temp_c',
+                    'specific_humidity', 'theta_e', 'shear', 'dew_point', 'frontogenesis',
+                    'icing', 'wetbulb', 'lapse_rate']:
+            if key in data and data[key] is not None and data[key].ndim == 2:
+                data[key] = filter_levels(data[key])
+
+        n_levels = len(pressure_levels_filtered)
+
+        if use_height:
+            # Convert geopotential height to km (gpm -> km)
+            # Use mean height at each pressure level for Y coordinate
+            heights_km = np.nanmean(geopotential_height, axis=1) / 1000.0  # gpm to km
+            X, Y = np.meshgrid(distances, heights_km)
+            y_coord = heights_km
+        else:
+            X, Y = np.meshgrid(distances, pressure_levels_filtered)
+            y_coord = pressure_levels_filtered
 
         # Style-specific shading
         shading_label = style
 
         if style == "wind_speed" and wind_speed is not None:
-            wspd_colors = ['#FFFFFF', '#E0F0FF', '#A0D0FF', '#60B0FF', '#FFFF80', '#FFC000', '#FF6000', '#FF0000']
-            wspd_cmap = mcolors.LinearSegmentedColormap.from_list('wspd', wspd_colors, N=256)
-            cf = ax.contourf(X, Y, wind_speed, levels=np.arange(0, 105, 5), cmap=wspd_cmap, extend='max')
-            cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+            # Wind speed colormap: PG&E/SJSU-WIRC style (smooth gradient)
+            # Blues for light-moderate, magenta for strong, yellow-orange-red for extreme
+            wspd_colors = [
+                (0.00, '#FFFFFF'),  # 0 kt - calm (white)
+                (0.10, '#E3F2FD'),  # 10 kt - light (very light blue)
+                (0.20, '#90CAF9'),  # 20 kt - light (light blue)
+                (0.30, '#42A5F5'),  # 30 kt - moderate (blue)
+                (0.40, '#1E88E5'),  # 40 kt - moderate (medium blue)
+                (0.50, '#7B1FA2'),  # 50 kt - fresh (magenta)
+                (0.60, '#E91E63'),  # 60 kt - strong (pink-magenta)
+                (0.70, '#FFEB3B'),  # 70 kt - very strong (yellow)
+                (0.80, '#FFC107'),  # 80 kt - gale (gold)
+                (0.90, '#FF9800'),  # 90 kt - strong gale (orange)
+                (1.00, '#F44336'),  # 100 kt - extreme (red)
+            ]
+            # Create smooth colormap from color stops
+            colors_only = [c[1] for c in wspd_colors]
+            wspd_cmap = mcolors.LinearSegmentedColormap.from_list('wspd', colors_only, N=256)
+            # Fine resolution levels for smooth gradient (every 2 kts)
+            cf = ax.contourf(X, Y, wind_speed, levels=np.arange(0, 102, 2), cmap=wspd_cmap, extend='max')
+            cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
             cbar.set_label('Wind Speed (kts)')
             shading_label = "Wind Speed"
         elif style == "temp":
             temp_c = data.get('temp_c')
             if temp_c is not None:
-                if surface_pressure is not None:
-                    temp_c = temp_c.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                temp_c[lev_idx, i] = np.nan
-                cf = ax.contourf(X, Y, temp_c, levels=np.arange(-60, 45, 5), cmap='coolwarm', extend='both')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                # NWS NDFD temperature color table
+                # Purple (cold) -> Blue -> Cyan -> YELLOW at 0°C -> Orange -> Red -> Magenta (hot)
+                ndfd_temp_colors = [
+                    '#9400D3',  # -60°C  Purple (extreme cold)
+                    '#6A00CD',  # -50°C  Purple
+                    '#0000CD',  # -40°C  Dark blue
+                    '#0000FF',  # -30°C  Blue
+                    '#00BFFF',  # -20°C  Deep sky blue
+                    '#00FFFF',  # -10°C  Cyan
+                    '#FFFF00',  # 0°C    YELLOW (freezing)
+                    '#FFD700',  # 10°C   Gold
+                    '#FFA500',  # 20°C   Orange
+                    '#FF4500',  # 30°C   Red-orange
+                    '#FF0000',  # 40°C   Red (extreme heat)
+                ]
+                ndfd_cmap = mcolors.LinearSegmentedColormap.from_list('ndfd_temp', ndfd_temp_colors, N=256)
+                cf = ax.contourf(X, Y, temp_c, levels=np.arange(-60, 45, 5), cmap=ndfd_cmap, extend='both')
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Temperature (°C)')
                 shading_label = "T(°C)"
         elif style == "rh":
             rh = data.get('rh')
             if rh is not None:
-                if surface_pressure is not None:
-                    rh = rh.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                rh[lev_idx, i] = np.nan
                 rh_colors = [(0.6, 0.4, 0.2), (0.7, 0.5, 0.3), (0.85, 0.75, 0.5),
                              (0.9, 0.9, 0.7), (0.7, 0.9, 0.7), (0.4, 0.8, 0.4),
                              (0.2, 0.6, 0.3), (0.1, 0.4, 0.2)]
                 rh_cmap = mcolors.LinearSegmentedColormap.from_list('rh', rh_colors, N=256)
                 cf = ax.contourf(X, Y, rh, levels=np.arange(0, 105, 5), cmap=rh_cmap, extend='both')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Relative Humidity (%)')
                 shading_label = "RH(%)"
         elif style == "omega":
             omega = data.get('omega')
             if omega is not None:
-                if surface_pressure is not None:
-                    omega = omega.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                omega[lev_idx, i] = np.nan
                 omega_display = omega * 36.0
                 omega_max = min(np.nanmax(np.abs(omega_display)), 20)
                 cf = ax.contourf(X, Y, omega_display, levels=np.linspace(-omega_max, omega_max, 21),
                                 cmap='RdBu_r', extend='both')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('ω (hPa/hr)')
                 shading_label = "ω"
         elif style == "theta_e":
             theta_e = data.get('theta_e')
             if theta_e is not None:
-                if surface_pressure is not None:
-                    theta_e = theta_e.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                theta_e[lev_idx, i] = np.nan
                 cf = ax.contourf(X, Y, theta_e, levels=np.arange(280, 365, 4), cmap='Spectral_r', extend='both')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('θₑ (K)')
                 shading_label = "θₑ"
         elif style == "shear":
             shear = data.get('shear')
             if shear is not None:
-                if surface_pressure is not None:
-                    shear = shear.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                shear[lev_idx, i] = np.nan
                 cf = ax.contourf(X, Y, shear, levels=np.linspace(0, 10, 11), cmap='OrRd', extend='max')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Shear (10⁻³/s)')
                 shading_label = "Shear"
         elif style == "q":
             q = data.get('specific_humidity')
             if q is not None:
                 q_gkg = q * 1000  # kg/kg to g/kg
-                if surface_pressure is not None:
-                    q_gkg = q_gkg.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                q_gkg[lev_idx, i] = np.nan
                 cf = ax.contourf(X, Y, q_gkg, levels=np.arange(0, 21, 1), cmap='YlGnBu', extend='max')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Specific Humidity (g/kg)')
                 shading_label = "q"
         elif style == "cloud_total":
             cloud = data.get('cloud')
             if cloud is not None:
                 cloud_gkg = cloud * 1000  # kg/kg to g/kg
-                if surface_pressure is not None:
-                    cloud_gkg = cloud_gkg.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                cloud_gkg[lev_idx, i] = np.nan
-                cloud_colors = ['#FFFFFF', '#E8E8E8', '#D0D0D0', '#B8B8B8', '#A0C0E0', '#80A0D0', '#6080C0']
+                # Cloud colormap: clear sky to dense cloud
+                cloud_colors = [
+                    '#FFFFFF',  # Clear
+                    '#F0F0F5',  # Very thin
+                    '#D8DCE8',  # Thin cirrus
+                    '#B8C4D8',  # Light cloud
+                    '#98ACC8',  # Moderate
+                    '#7894B8',  # Thick
+                    '#5878A8',  # Dense
+                    '#385898',  # Very dense
+                ]
                 cloud_cmap = mcolors.LinearSegmentedColormap.from_list('cloud', cloud_colors, N=256)
                 cf = ax.contourf(X, Y, cloud_gkg, levels=np.linspace(0, 1.0, 11), cmap=cloud_cmap, extend='max')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
-                cbar.set_label('Cloud Water (g/kg)')
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar.set_label('Total Condensate (g/kg)')
                 shading_label = "Cloud"
         elif style == "cloud":
             cloud = data.get('cloud')
             if cloud is not None:
                 cloud_gkg = cloud * 1000
-                if surface_pressure is not None:
-                    cloud_gkg = cloud_gkg.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                cloud_gkg[lev_idx, i] = np.nan
                 cf = ax.contourf(X, Y, cloud_gkg, levels=np.linspace(0, 0.5, 11), cmap='Blues', extend='max')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Cloud LWC (g/kg)')
                 shading_label = "Cloud"
         elif style == "lapse_rate":
             lapse = data.get('lapse_rate')
             if lapse is not None:
-                if surface_pressure is not None:
-                    lapse = lapse.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                lapse[lev_idx, i] = np.nan
                 # Diverging colormap: blue (stable) -> white -> red (unstable)
                 cf = ax.contourf(X, Y, lapse, levels=np.linspace(0, 12, 13), cmap='RdYlBu_r', extend='both')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Lapse Rate (°C/km)')
                 # Add dry adiabatic line
                 ax.contour(X, Y, lapse, levels=[9.8], colors='black', linewidths=2, linestyles='--')
@@ -1091,65 +1189,52 @@ class InteractiveCrossSection:
         elif style == "wetbulb":
             wetbulb = data.get('wetbulb')
             if wetbulb is not None:
-                if surface_pressure is not None:
-                    wetbulb = wetbulb.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                wetbulb[lev_idx, i] = np.nan
                 cf = ax.contourf(X, Y, wetbulb, levels=np.arange(-40, 35, 5), cmap='coolwarm', extend='both')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Wet-Bulb Temp (°C)')
                 # Wet-bulb 0°C line (critical for precip type)
                 try:
-                    cs_wb0 = ax.contour(X, Y, wetbulb, levels=[0], colors='cyan', linewidths=2.5)
-                    ax.clabel(cs_wb0, inline=True, fontsize=9, fmt='Tw=0')
+                    cs_wb0 = ax.contour(X, Y, wetbulb, levels=[0], colors='lime', linewidths=3)
+                    ax.clabel(cs_wb0, inline=True, fontsize=9, fmt='Tw=0°C', colors='black')
                 except:
                     pass
                 shading_label = "Tw"
         elif style == "icing":
             icing = data.get('icing')
             if icing is not None:
-                if surface_pressure is not None:
-                    icing = icing.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                icing[lev_idx, i] = np.nan
-                # Purple gradient for icing intensity
-                icing_colors = ['#FFFFFF', '#E8D8F0', '#D0B0E0', '#B888D0', '#A060C0', '#8838B0', '#7010A0']
+                # Icing colormap: clear → light blue → cyan → intense blue
+                # Blues convey "cold/ice hazard" intuitively
+                icing_colors = [
+                    '#FFFFFF',  # None
+                    '#E3F2FD',  # Trace
+                    '#BBDEFB',  # Light
+                    '#64B5F6',  # Light-Moderate
+                    '#2196F3',  # Moderate
+                    '#1565C0',  # Moderate-Severe
+                    '#0D47A1',  # Severe
+                ]
                 icing_cmap = mcolors.LinearSegmentedColormap.from_list('icing', icing_colors, N=256)
                 cf = ax.contourf(X, Y, icing, levels=np.linspace(0, 0.3, 7), cmap=icing_cmap, extend='max')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Icing (SLW g/kg)')
                 shading_label = "Icing"
         elif style == "vorticity":
             vort = data.get('vorticity')
             if vort is not None:
                 vort_scaled = vort * 1e5  # Scale for display
-                if surface_pressure is not None:
-                    vort_scaled = vort_scaled.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                vort_scaled[lev_idx, i] = np.nan
                 vort_max = min(np.nanmax(np.abs(vort_scaled)), 30)
                 cf = ax.contourf(X, Y, vort_scaled, levels=np.linspace(-vort_max, vort_max, 21),
                                 cmap='RdBu_r', extend='both')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Vorticity (10⁻⁵/s)')
                 shading_label = "ζ"
         elif style == "frontogenesis":
             # Winter Bander Mode - Petterssen Frontogenesis
             fronto = data.get('frontogenesis')
             if fronto is not None:
-                if surface_pressure is not None:
-                    fronto = fronto.copy()
-                    for i in range(n_points):
-                        for lev_idx, plev in enumerate(pressure_levels):
-                            if plev > surface_pressure[i]:
-                                fronto[lev_idx, i] = np.nan
-
                 # Diverging colormap: blue (frontolysis) -> white -> red (frontogenesis)
                 # Red = frontogenesis (temperature gradient increasing) = banding
                 # Blue = frontolysis (temperature gradient decreasing)
@@ -1161,7 +1246,8 @@ class InteractiveCrossSection:
                 # Levels centered on zero, range typically -2 to +2 K/100km/3hr
                 levels = np.linspace(-2, 2, 21)
                 cf = ax.contourf(X, Y, fronto, levels=levels, cmap=fronto_cmap, extend='both')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Frontogenesis (K/100km/3hr)')
 
                 # Highlight strong frontogenesis bands
@@ -1176,7 +1262,8 @@ class InteractiveCrossSection:
             # Default to theta shading
             if theta is not None:
                 cf = ax.contourf(X, Y, theta, levels=np.arange(270, 360, 4), cmap='viridis', extend='both')
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.9)
+                cbar_ax = fig.add_axes([0.93, 0.07, 0.015, 0.73])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('θ (K)')
                 shading_label = "θ"
 
@@ -1188,12 +1275,6 @@ class InteractiveCrossSection:
         # Temperature overlays (freezing level, DGZ, additional isotherms)
         if temperature is not None:
             temp_c_plot = temperature - 273.15
-            if surface_pressure is not None:
-                temp_c_plot = temp_c_plot.copy()
-                for i in range(n_points):
-                    for lev_idx, plev in enumerate(pressure_levels):
-                        if plev > surface_pressure[i]:
-                            temp_c_plot[lev_idx, i] = np.nan
             try:
                 # Freezing level (0°C) - magenta
                 ax.contour(X, Y, temp_c_plot, levels=[0], colors='magenta', linewidths=2)
@@ -1224,7 +1305,7 @@ class InteractiveCrossSection:
             y_idx = np.arange(0, n_levels, y_skip)
 
             X_barb = distances[x_idx]
-            Y_barb = pressure_levels[y_idx]
+            Y_barb = y_coord[y_idx]  # Use appropriate Y coordinate (height or pressure)
             XX_barb, YY_barb = np.meshgrid(X_barb, Y_barb)
 
             # Get wind at subsampled points
@@ -1236,7 +1317,7 @@ class InteractiveCrossSection:
                 for i, xi in enumerate(x_idx):
                     sp = surface_pressure[xi]
                     for j, yj in enumerate(y_idx):
-                        if pressure_levels[yj] > sp:
+                        if pressure_levels_filtered[yj] > sp:
                             U_barb[j, i] = np.nan
                             V_barb[j, i] = np.nan
 
@@ -1244,14 +1325,11 @@ class InteractiveCrossSection:
             U_kt = U_barb * 1.944
             V_kt = V_barb * 1.944
 
-            # Rotate winds to cross-section view
-            dlat = lats[-1] - lats[0]
-            dlon = lons[-1] - lons[0]
-            section_azimuth = np.arctan2(dlon * np.cos(np.radians(np.mean(lats))), dlat)
-
-            # Rotate wind vectors so section-parallel is horizontal
-            U_rot = U_kt * np.sin(section_azimuth) + V_kt * np.cos(section_azimuth)
-            V_rot = -U_kt * np.cos(section_azimuth) + V_kt * np.sin(section_azimuth)
+            # Show wind direction relative to cross-section orientation
+            # Barbs point in direction wind is FROM
+            # U_kt = eastward component, V_kt = northward component
+            U_rot = U_kt
+            V_rot = V_kt
 
             # Plot wind barbs
             ax.barbs(
@@ -1261,20 +1339,58 @@ class InteractiveCrossSection:
                 sizes=dict(emptybarb=0.04, spacing=0.12, height=0.35),
             )
 
-        # Terrain fill
+        # Terrain fill - use high-resolution terrain data if available
         if surface_pressure is not None:
-            max_p = max(pressure_levels.max(), surface_pressure.max()) + 20
-            terrain_x = np.concatenate([[distances[0]], distances, [distances[-1]]])
-            terrain_y = np.concatenate([[max_p], surface_pressure, [max_p]])
-            ax.fill(terrain_x, terrain_y, color='saddlebrown', alpha=0.9, zorder=5)
-            ax.plot(distances, surface_pressure, 'k-', linewidth=1.5, zorder=6)
+            # Prefer native high-res terrain from extraction
+            sp_hires = data.get('surface_pressure_hires')
+            dist_hires = data.get('distances_hires')
 
-        # Axes
-        ax.set_ylim(max(pressure_levels), min(pressure_levels))
+            if sp_hires is None or dist_hires is None:
+                # Fallback: use native ~3km HRRR resolution
+                from scipy.interpolate import interp1d
+                total_dist_km = distances[-1]
+                terrain_res = max(50, int(total_dist_km / 3))  # Native 3km spacing
+                dist_hires = np.linspace(distances[0], distances[-1], terrain_res)
+                try:
+                    sp_interp = interp1d(distances, surface_pressure, kind='linear',
+                                        bounds_error=False, fill_value='extrapolate')
+                    sp_hires = sp_interp(dist_hires)
+                except Exception:
+                    sp_hires = np.interp(dist_hires, distances, surface_pressure)
+
+            if use_height:
+                # For height axis: convert surface pressure to approximate terrain height
+                # Use hypsometric equation: z ≈ 44330 * (1 - (P/P0)^0.19) meters
+                # where P0 = 1013.25 hPa (sea level pressure)
+                terrain_height_m = 44330 * (1 - (sp_hires / 1013.25) ** 0.19)
+                terrain_height_km = terrain_height_m / 1000.0
+                terrain_x = np.concatenate([[dist_hires[0]], dist_hires, [dist_hires[-1]]])
+                terrain_y = np.concatenate([[0], terrain_height_km, [0]])
+                ax.fill(terrain_x, terrain_y, color='saddlebrown', alpha=0.9, zorder=5)
+                ax.plot(dist_hires, terrain_height_km, 'k-', linewidth=1.5, zorder=6)
+            else:
+                # Pressure axis: fill below surface pressure
+                max_p = max(pressure_levels_filtered.max(), np.nanmax(sp_hires)) + 20
+                terrain_x = np.concatenate([[dist_hires[0]], dist_hires, [dist_hires[-1]]])
+                terrain_y = np.concatenate([[max_p], sp_hires, [max_p]])
+                ax.fill(terrain_x, terrain_y, color='saddlebrown', alpha=0.9, zorder=5)
+                ax.plot(dist_hires, sp_hires, 'k-', linewidth=1.5, zorder=6)
+
+        # Axes - configure based on y_axis choice
         ax.set_xlim(0, distances[-1])
         ax.set_xlabel('Distance (km)', fontsize=11)
-        ax.set_ylabel('Pressure (hPa)', fontsize=11)
-        ax.yaxis.set_major_locator(MultipleLocator(100))
+
+        if use_height:
+            # Height axis: 0 at bottom, increasing upward
+            ax.set_ylim(0, max(y_coord))
+            ax.set_ylabel('Height (km)', fontsize=11)
+            ax.yaxis.set_major_locator(MultipleLocator(2))  # Every 2 km
+        else:
+            # Pressure axis: high values at bottom (surface), low at top
+            ax.set_ylim(max(pressure_levels_filtered), min(pressure_levels_filtered))
+            ax.set_ylabel('Pressure (hPa)', fontsize=11)
+            ax.yaxis.set_major_locator(MultipleLocator(100))
+
         ax.grid(True, alpha=0.3)
 
         # Title with full metadata
@@ -1286,18 +1402,83 @@ class InteractiveCrossSection:
         ax.set_title(f'Init: {init_str}  |  F{forecast_hour:02d}  |  Valid: {valid_str}',
                     fontsize=10, loc='right', color='#555')
 
-        # Add path info at bottom of figure
+        # Add path info at bottom of figure (left-aligned)
         total_dist = distances[-1]
         path_text = f'({lats[0]:.2f}°, {lons[0]:.2f}°) → ({lats[-1]:.2f}°, {lons[-1]:.2f}°)  [{total_dist:.0f} km]'
-        fig.text(0.5, 0.01, path_text, ha='center', fontsize=9, color='#666',
+        fig.text(0.08, 0.02, path_text, ha='left', fontsize=9, color='#666',
                 transform=fig.transFigure)
 
-        # Adjust layout to make room for bottom text
-        plt.subplots_adjust(bottom=0.12)
+        # Add professional inset map showing cross-section path
+        try:
+            import cartopy.crs as ccrs
+            import cartopy.feature as cfeature
 
-        # Save to bytes
+            # Calculate extent with padding
+            lon_min, lon_max = min(lons) - 2, max(lons) + 2
+            lat_min, lat_max = min(lats) - 1.5, max(lats) + 1.5
+
+            # Ensure minimum extent so map doesn't get too skinny
+            lon_range = lon_max - lon_min
+            lat_range = lat_max - lat_min
+
+            # Enforce minimum aspect ratio (lon:lat around 1.5:1 for reasonable look)
+            min_lat_range = lon_range / 2.5  # At least this much latitude span
+            if lat_range < min_lat_range:
+                lat_center = (lat_min + lat_max) / 2
+                lat_min = lat_center - min_lat_range / 2
+                lat_max = lat_center + min_lat_range / 2
+
+            # Calculate inset size based on aspect ratio
+            aspect = lon_range / max(lat_range, 0.1)
+            inset_width = min(0.25, max(0.16, 0.20 * (aspect / 2)))
+            inset_height = 0.12
+
+            # Place inset map above plot, right-aligned (in the top margin)
+            axins = fig.add_axes([0.92 - inset_width, 0.84, inset_width, inset_height],
+                                projection=ccrs.PlateCarree())
+            axins.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+
+            # Add terrain/imagery background
+            try:
+                axins.stock_img()  # Natural Earth terrain
+            except:
+                # Fallback to simple features
+                axins.add_feature(cfeature.LAND, facecolor='#C4B896', zorder=0)
+                axins.add_feature(cfeature.OCEAN, facecolor='#97B6C8', zorder=0)
+
+            # Add map features
+            axins.add_feature(cfeature.LAKES, facecolor='#97B6C8', edgecolor='#6090A0', linewidth=0.3, zorder=1)
+            axins.add_feature(cfeature.STATES, edgecolor='#666666', linewidth=0.4, zorder=2)
+            axins.add_feature(cfeature.BORDERS, edgecolor='#333333', linewidth=0.6, zorder=2)
+            axins.add_feature(cfeature.COASTLINE, edgecolor='#444444', linewidth=0.5, zorder=2)
+
+            # Draw cross-section path
+            axins.plot(lons, lats, 'r-', linewidth=2.5, transform=ccrs.PlateCarree(), zorder=10)
+            # Start point (blue)
+            axins.plot(lons[0], lats[0], 'o', color='#38bdf8', markersize=8,
+                      markeredgecolor='white', markeredgewidth=1.5,
+                      transform=ccrs.PlateCarree(), zorder=11)
+            # End point (red)
+            axins.plot(lons[-1], lats[-1], 'o', color='#f87171', markersize=8,
+                      markeredgecolor='white', markeredgewidth=1.5,
+                      transform=ccrs.PlateCarree(), zorder=11)
+
+            # Style the border
+            for spine in axins.spines.values():
+                spine.set_edgecolor('black')
+                spine.set_linewidth(1.5)
+
+        except Exception as e:
+            pass  # Skip inset if cartopy fails
+
+        # Add credit (centered, below coords line)
+        fig.text(0.5, 0.005, 'CA Wildfire Tracking Research Collaborative  •  Mesoscale Analysis Division',
+                 ha='center', va='bottom', fontsize=7, color='#888888',
+                 transform=fig.transFigure, style='italic')
+
+        # Save to bytes (don't use tight_layout or bbox_inches - conflicts with inset positioning)
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=dpi, bbox_inches='tight', facecolor='white')
+        plt.savefig(buf, format='png', dpi=dpi, facecolor='white')
         plt.close(fig)
         buf.seek(0)
 
@@ -1309,7 +1490,11 @@ class InteractiveCrossSection:
 
     def get_memory_usage(self) -> float:
         """Get total memory usage in MB."""
-        return sum(fh.memory_usage_mb() for fh in self.forecast_hours.values())
+        try:
+            return sum(fh.memory_usage_mb() for fh in list(self.forecast_hours.values()))
+        except RuntimeError:
+            # Dict changed size during iteration (concurrent load/unload)
+            return 0.0
 
     def unload_hour(self, forecast_hour: int):
         """Unload a forecast hour to free memory."""

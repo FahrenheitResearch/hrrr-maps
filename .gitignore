@@ -6,8 +6,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+venv/
+.venv/
 
-# Outputs and data
+# Data files (GRIB, NetCDF, cache)
+data/
 outputs/
 cache/
 grib_files/
@@ -16,6 +19,12 @@ grib_files/
 *.nc
 *.npz
 
+# Images (screenshots, test outputs)
+*.png
+*.jpg
+*.jpeg
+*.gif
+
 # Logs
 *.log
 
@@ -23,9 +32,14 @@ grib_files/
 .vscode/
 .idea/
 
-# Zone identifiers (Windows)
+# Zone identifiers (Windows/WSL)
 *:Zone.Identifier
 
-# Environment
+# Environment / secrets
 .env
 *.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db

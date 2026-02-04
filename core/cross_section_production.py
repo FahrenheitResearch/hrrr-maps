@@ -832,18 +832,14 @@ def create_production_cross_section(
             U_kt = U_barb * 1.944
             V_kt = V_barb * 1.944
 
-            # Rotate winds to cross-section view
-            # Calculate section azimuth
-            dlat = lats[-1] - lats[0]
-            dlon = lons[-1] - lons[0]
-            section_azimuth = np.arctan2(dlon * np.cos(np.radians(np.mean(lats))), dlat)
+            # Show TRUE meteorological wind (not rotated to section)
+            # U = eastward component, displayed as horizontal barb component
+            # V = 0 for display (barbs are horizontal-only, showing zonal wind)
+            # This makes barbs direction-invariant (same result A→B or B→A)
+            U_rot = U_kt  # Eastward wind: positive = from west
+            V_rot = np.zeros_like(U_kt)  # Horizontal barbs only
 
-            # Rotate wind vectors so section-parallel is horizontal
-            U_rot = U_kt * np.sin(section_azimuth) + V_kt * np.cos(section_azimuth)
-            V_rot = -U_kt * np.cos(section_azimuth) + V_kt * np.sin(section_azimuth)
-
-            # Plot wind barbs - V_rot shows cross-section perpendicular component
-            # For display, we show the rotated barbs
+            # Plot wind barbs - showing true zonal (east-west) wind
             ax.barbs(
                 XX_barb, YY_barb, U_rot, V_rot,
                 length=5, barbcolor='black', flagcolor='black',
