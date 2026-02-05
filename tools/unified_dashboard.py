@@ -792,13 +792,10 @@ class CrossSectionManager:
             logger.info(f"Unloaded {cycle_key} F{fhr:02d}")
 
     def unload_forecast_hour(self, cycle_key: str, fhr: int, is_admin: bool = False) -> dict:
-        """Explicitly unload a forecast hour. Protected cycles require admin."""
+        """Explicitly unload a forecast hour."""
         with self._lock:
             if (cycle_key, fhr) not in self.loaded_items:
                 return {'success': True, 'not_loaded': True}
-
-            if not is_admin and cycle_key in self.get_protected_cycles():
-                return {'success': False, 'error': 'Cannot unload latest cycles'}
 
             self._unload_item(cycle_key, fhr)
             self.loaded_items.remove((cycle_key, fhr))
@@ -1611,7 +1608,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 </select>
                 <button id="clear-btn">Clear Line</button>
                 <button id="admin-key-btn" title="Enter admin key for archive access" style="padding:4px 8px;font-size:13px;">🔒</button>
-                <button id="load-all-btn" title="Load all FHRs for current cycle" style="padding:4px 8px;font-size:12px;display:none;">Load All</button>
+                <button id="load-all-btn" title="Load all FHRs for current cycle" style="padding:4px 8px;font-size:12px;">Load All</button>
                 <div id="memory-status">
                     <span id="mem-text">0 MB</span>
                     <div class="mem-bar"><div class="mem-fill" id="mem-fill" style="width:0%"></div></div>
@@ -1714,7 +1711,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const btn = document.getElementById('admin-key-btn');
             btn.textContent = valid ? '🔓' : '🔒';
             btn.title = valid ? 'Admin mode active (click to change key)' : 'Enter admin key for archive access';
-            document.getElementById('load-all-btn').style.display = valid ? '' : 'none';
+            document.getElementById('load-all-btn').style.display = '';  // Always visible (mmap makes loading cheap)
         }
         document.getElementById('admin-key-btn').onclick = async function() {
             const key = prompt(isAdmin ? 'Admin key (current key active, clear to revoke):' : 'Enter admin key:', getAdminKey());
@@ -1726,9 +1723,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         };
         checkAdminKey();
 
-        // Load All button (admin only) — loads every FHR for current cycle
+        // Load All button — loads every FHR for current cycle
         document.getElementById('load-all-btn').onclick = async () => {
-            if (!currentCycle || !isAdmin) return;
+            if (!currentCycle) return;
             const btn = document.getElementById('load-all-btn');
             btn.disabled = true;
             btn.textContent = 'Loading...';
@@ -2971,9 +2968,6 @@ def api_load():
     except ValueError:
         return jsonify({'success': False, 'error': 'Invalid fhr'}), 400
 
-    if data_manager.is_archive_cycle(cycle_key) and not check_admin_key():
-        return jsonify({'success': False, 'error': 'Admin key required to load archive data'}), 403
-
     result = data_manager.load_forecast_hour(cycle_key, fhr)
     return jsonify(result)
 
@@ -2985,9 +2979,6 @@ def api_load_cycle():
 
     if not cycle_key:
         return jsonify({'success': False, 'error': 'Missing cycle parameter'}), 400
-
-    if data_manager.is_archive_cycle(cycle_key) and not check_admin_key():
-        return jsonify({'success': False, 'error': 'Admin key required to load archive data'}), 403
 
     result = data_manager.load_cycle(cycle_key)
     touch_cycle_access(cycle_key)
@@ -3087,21 +3078,17 @@ def api_xsect_gif():
         gif_temp_cmap = 'green_purple'
     gif_anomaly = request.args.get('anomaly', '0') == '1'
 
-    # Admin gets all loaded FHRs (up to 19 frames); regular users get every 3rd hour only
-    if check_admin_key():
-        loaded_fhrs = sorted(fhr for ck, fhr in data_manager.loaded_items
-                             if ck == cycle_key)
-    else:
-        loaded_fhrs = sorted(fhr for ck, fhr in data_manager.loaded_items
-                             if ck == cycle_key and fhr % 3 == 0)
+    # All loaded FHRs available for GIF (mmap makes loading all FHRs cheap)
+    loaded_fhrs = sorted(fhr for ck, fhr in data_manager.loaded_items
+                         if ck == cycle_key)
     if len(loaded_fhrs) < 2:
         return jsonify({'error': f'Need at least 2 loaded FHRs for GIF (have {len(loaded_fhrs)})'}), 400
 
     # Lock terrain to first FHR so elevation doesn't jitter between frames
     terrain_data = data_manager.get_terrain_data(start, end, cycle_key, loaded_fhrs[0], style)
 
-    # GIF holds the semaphore for its entire render sequence (up to 19 frames for admin)
-    sem_timeout = 90 if check_admin_key() else 30
+    # GIF holds the semaphore for its entire render sequence (up to 19 frames)
+    sem_timeout = 90
     acquired = RENDER_SEMAPHORE.acquire(timeout=sem_timeout)
     if not acquired:
         return jsonify({'error': 'Server busy, try again in a moment'}), 503

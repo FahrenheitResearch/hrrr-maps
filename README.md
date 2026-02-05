@@ -27,7 +27,7 @@ export WXSECTION_KEY=your_admin_key
 
 # Or run manually:
 python tools/auto_update.py --interval 2 --max-hours 18 &
-python tools/unified_dashboard.py --port 5559 --preload 2
+python tools/unified_dashboard.py --port 5559 --preload 24
 ```
 
 ## Features
@@ -36,8 +36,8 @@ python tools/unified_dashboard.py --port 5559 --preload 2
 - **Leaflet map** with click-to-place markers and draggable endpoints
 - **15 visualization styles** via dropdown with community voting
 - **19 forecast hours** (F00-F18) with color-coded chip system:
-  - **Grey** = downloaded, not loaded (click to load, ~15s)
-  - **Green** = loaded in RAM (click for instant view)
+  - **Grey** = on disk, not opened (click to open via mmap, ~14ms if cached)
+  - **Green** = opened (mmap handles ready, click for instant view)
   - **Blue** = currently viewing
   - **Yellow pulse** = loading in progress
   - **Shift+click** to unload (prevents accidental unloads)
@@ -47,11 +47,11 @@ python tools/unified_dashboard.py --port 5559 --preload 2
 - **Vertical range selector** - full atmosphere (100 hPa), mid (300), low (500), boundary layer (700)
 - **Distance units toggle** - km or miles
 - **Community favorites** - save/load cross-section configs by name, auto-expire after 12h
-- **GIF animation** - animated GIF with 4 speed options (0.25x/0.5x/0.75x/1x), Pillow rendering with `disposal=2` for Discord compatibility. Admin users get all loaded FHRs (up to 19 frames), regular users get every-3rd-hour only
+- **GIF animation** - animated GIF with 4 speed options (0.25x/0.5x/0.75x/1x), Pillow rendering with `disposal=2` for Discord compatibility. All loaded FHRs included (up to 19 frames)
 - **Temperature colormap picker** - 3 color tables (Green-Purple, White at 0°C, NWS Classic) switchable on the fly
 - **Anomaly/departure toggle** - "Raw / 5yr Dep" mode subtracts 5-year HRRR climatological mean from current forecast. RdBu_r diverging colormap centered at 0. Works for 10 styles (temp, wind_speed, rh, omega, theta_e, q, vorticity, shear, lapse_rate, wetbulb). Toggle auto-hides when climatology unavailable for current month/style
-- **Admin key system** - lock icon (🔒) for archive access, stored in browser localStorage
-- **Load All button** - admin-only button to load all FHRs for the current cycle at once
+- **Admin key system** - lock icon (🔒) for custom date downloads only, stored in browser localStorage
+- **Load All button** - loads all FHRs for the current cycle at once (available to all users)
 
 ### Plot Annotations
 - **A/B endpoint labels** on the cross-section and inset map
@@ -66,28 +66,29 @@ python tools/unified_dashboard.py --port 5559 --preload 2
 - Maintains latest 2 init cycles with F00-F18 (full forecast set)
 - Client-side auto-refresh polls every 60s for newly available data
 - Background server rescan detects new downloads without restart
-- **Auto-load**: new FHRs for latest 2 cycles automatically load into RAM as they're downloaded (every 60s check)
+- **Auto-load**: new FHRs for all available cycles automatically opened as they're downloaded (every 60s check)
 - **Parallel loading** with 2 worker threads for preloading and on-demand cycle loads
 - **Loading mutex** prevents overlapping bulk loads (preload, auto-load, and Load All queue instead of fighting)
 - **Startup progress bar** shows preload progress in the UI as FHRs load after restart
 
-### Memory Management
-- **Every-3rd-hour preloading** - latest 2 cycles pre-loaded with F00, F03, F06, F09, F12, F15, F18 via 2 parallel workers to balance RAM (~52-62 GB) vs coverage
-- **Protected cycles** - latest 2 init cycles cannot be unloaded by regular users or evicted by LRU
-- **LRU eviction** starting at 115 GB, hard cap at 117 GB (skips protected cycles)
-- Unique engine key mapping allows multiple init cycles loaded simultaneously
-- Non-preloaded forecast hours load on-demand when requested
+### Memory Management (Mmap Cache)
+- **Memory-mapped cache** - per-field `.npy` files in float16, opened via `np.load(mmap_mode='r')`. OS page cache manages physical RAM automatically
+- **All FHRs preloaded** - latest 24 cycles × all 19 FHRs opened at startup (~29MB heap each, ~13GB total vs old 111GB for 30 FHRs)
+- **143x faster cache load** - ~14ms mmap open vs ~2s old NPZ decompress
+- **38% less disk** - float16 fields at ~2.3GB/FHR vs ~3.7GB old NPZ
+- **Legacy migration** - old `.npz` caches auto-convert to mmap on first load, then are deleted
+- **LRU eviction** starting at 115 GB heap, hard cap at 117 GB (rarely triggers with mmap)
 - **Render semaphore** - caps concurrent matplotlib renders at 4 to prevent CPU/memory thrash under load
 
 ### Admin Key System
 - Set via `WXSECTION_KEY` environment variable (never stored in code)
-- **Required for**: loading archive/older cycles into RAM, downloading custom dates, unloading protected cycles, Load All button, full-frame GIF
-- **Not required for**: viewing cross-sections from already-loaded data, loading FHRs in latest 2 cycles, every-3rd-hour GIF
+- **Required for**: downloading custom dates from NOMADS/AWS (`/api/request_cycle`)
+- **Not required for**: loading/unloading any cycle, Load All, full-frame GIF, viewing cross-sections
 - UI: click 🔒 icon, enter key, saved to browser localStorage
 - Validates via `/api/check_key` endpoint
 
 ### Disk Storage
-- **NPZ cache** with configurable limit (default 400 GB) - separate from GRIB storage
+- **Mmap cache** with configurable limit (default 400 GB) - per-field `.npy` directories, separate from GRIB storage
 - **GRIB disk limit** of 500 GB with space-based eviction
 - **Popularity tracking** via `data/disk_meta.json` (last accessed time + access count)
 - Protected cycles: latest 2 auto-update targets + anything accessed in last 2 hours
@@ -109,11 +110,12 @@ python tools/unified_dashboard.py --port 5559 --preload 2
 - **10 eligible styles** - temp, wind_speed, rh, omega, theta_e, q, vorticity, shear, lapse_rate, wetbulb (cloud/icing/frontogenesis/smoke excluded)
 
 ### Performance
-- **Sub-second generation** after data is loaded (~0.3s typical)
-- **NPZ caching** - first GRIB load ~25s, subsequent loads ~2s from cache (stale cache auto-detected if <35 pressure levels)
+- **Sub-second generation** (~0.9s typical with mmap, same as RAM-loaded)
+- **Mmap caching** - first GRIB load ~25s (saves to mmap cache), subsequent opens ~14ms (memory-mapped, no data read)
+- **Float16 storage** - 3D fields stored as float16 for ~38% disk savings, cast to float32 on-the-fly during interpolation
 - **Parallel GRIB download** with configurable thread count
-- Non-blocking startup - Flask serves immediately while data loads in background
-- **Render semaphore** prevents server overload under concurrent use (10-25 users)
+- Non-blocking startup - Flask serves immediately while data opens in background
+- **Render semaphore** prevents server overload under concurrent use
 
 ### Production Ready
 - Rate limiting (60 req/min) for public deployment
@@ -320,7 +322,7 @@ WXSECTION_KEY=secret python tools/unified_dashboard.py [OPTIONS]
 
 --port PORT          Server port (default: 5559)
 --host HOST          Server host (default: 0.0.0.0)
---preload N          Cycles to pre-load at startup (default: 0)
+--preload N          Cycles to pre-load at startup (default: 24, mmap makes this cheap)
 --production         Enable rate limiting
 --auto-update        Download latest data before starting
 --max-hours N        Max forecast hour to download
