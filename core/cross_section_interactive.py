@@ -64,10 +64,14 @@ class ForecastHourData:
     temp_c: np.ndarray = None  # C
 
     def memory_usage_mb(self) -> float:
-        """Estimate memory usage in MB."""
+        """Estimate memory usage in MB.
+
+        Memory-mapped arrays (np.memmap) report 0 MB since the OS page cache
+        manages their physical memory, not the Python heap.
+        """
         total = 0
         for name, val in self.__dict__.items():
-            if isinstance(val, np.ndarray):
+            if isinstance(val, np.ndarray) and not isinstance(val, np.memmap):
                 total += val.nbytes
         return total / 1024 / 1024
 
@@ -291,63 +295,97 @@ class InteractiveCrossSection:
         self.climatology_dir = None  # Path to climo NPZ directory
         self._climo_cache: Dict[str, ClimatologyData] = {}  # "MM_HHz_FNN" -> data
 
-    def _get_cache_path(self, grib_file: str) -> Optional[Path]:
-        """Get cache path for a GRIB file."""
+    def _get_cache_stem(self, grib_file: str) -> Optional[str]:
+        """Get cache name stem (without extension) for a GRIB file."""
         if not self.cache_dir:
             return None
-        # Create unique cache name based on GRIB path
         grib_path = Path(grib_file)
         # e.g., outputs/hrrr/20251224/19z/F00/hrrr.t19z.wrfprsf00.grib2
-        # -> 20251224_19z_F00_hrrr.t19z.wrfprsf00.npz
+        # -> 20251224_19z_F00_hrrr.t19z.wrfprsf00
         parts = grib_path.parts
         try:
             date_idx = next(i for i, p in enumerate(parts) if p.isdigit() and len(p) == 8)
-            cache_name = f"{parts[date_idx]}_{parts[date_idx+1]}_{parts[date_idx+2]}_{grib_path.stem}.npz"
+            return f"{parts[date_idx]}_{parts[date_idx+1]}_{parts[date_idx+2]}_{grib_path.stem}"
         except (StopIteration, IndexError):
-            cache_name = f"{grib_path.stem}.npz"
-        return self.cache_dir / cache_name
+            return grib_path.stem
+
+    def _get_mmap_cache_dir(self, grib_file: str) -> Optional[Path]:
+        """Get mmap cache directory path for a GRIB file."""
+        stem = self._get_cache_stem(grib_file)
+        if stem is None:
+            return None
+        return self.cache_dir / stem
+
+    def _get_legacy_cache_path(self, grib_file: str) -> Optional[Path]:
+        """Get legacy .npz cache path for a GRIB file (migration support)."""
+        stem = self._get_cache_stem(grib_file)
+        if stem is None:
+            return None
+        return self.cache_dir / f"{stem}.npz"
 
     def _cleanup_cache(self):
-        """Evict oldest NPZ cache files if cache exceeds CACHE_LIMIT_GB."""
+        """Evict oldest cache entries if cache exceeds CACHE_LIMIT_GB.
+
+        Handles both mmap directories and legacy .npz files.
+        """
         if not self.cache_dir:
             return
         try:
-            files = list(self.cache_dir.glob('*.npz'))
-            total_bytes = sum(f.stat().st_size for f in files)
+            import shutil
+            entries = []  # (path, size_bytes, atime)
+
+            # Legacy .npz files
+            for f in self.cache_dir.glob('*.npz'):
+                stat = f.stat()
+                entries.append((f, stat.st_size, stat.st_atime))
+
+            # Mmap cache directories (contain _complete marker)
+            for d in self.cache_dir.iterdir():
+                if d.is_dir() and (d / '_complete').exists():
+                    dir_size = sum(ff.stat().st_size for ff in d.iterdir() if ff.is_file())
+                    # Use _complete marker atime as directory access time
+                    atime = (d / '_complete').stat().st_atime
+                    entries.append((d, dir_size, atime))
+
+            total_bytes = sum(e[1] for e in entries)
             total_gb = total_bytes / (1024 ** 3)
             if total_gb <= self.CACHE_LIMIT_GB:
                 return
-            # Sort by access time (oldest first) and delete until under 85% of limit
+
             target_gb = self.CACHE_LIMIT_GB * 0.85
-            files.sort(key=lambda f: f.stat().st_atime)
-            for f in files:
+            entries.sort(key=lambda e: e[2])  # oldest access first
+            for path, size_bytes, _ in entries:
                 if total_gb <= target_gb:
                     break
-                size_gb = f.stat().st_size / (1024 ** 3)
-                f.unlink()
+                size_gb = size_bytes / (1024 ** 3)
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
                 total_gb -= size_gb
-                print(f"Cache cleanup: removed {f.name} ({size_gb:.1f}GB), {total_gb:.1f}GB remaining")
+                print(f"Cache cleanup: removed {path.name} ({size_gb:.1f}GB), {total_gb:.1f}GB remaining")
         except Exception as e:
             print(f"Cache cleanup error: {e}")
 
-    def _save_to_cache(self, fhr_data: ForecastHourData, cache_path: Path):
-        """Save ForecastHourData to numpy format (uncompressed for speed)."""
+    # --- Legacy NPZ cache (for migration) ---
+
+    def _save_to_legacy_cache(self, fhr_data: ForecastHourData, cache_path: Path):
+        """Save ForecastHourData to legacy NPZ format (uncompressed)."""
         data = {'forecast_hour': np.array([fhr_data.forecast_hour])}
 
-        for field in ['pressure_levels', 'lats', 'lons', 'temperature', 'u_wind', 'v_wind',
+        for field_name in ['pressure_levels', 'lats', 'lons', 'temperature', 'u_wind', 'v_wind',
                       'rh', 'omega', 'specific_humidity', 'geopotential_height', 'vorticity',
                       'cloud', 'dew_point', 'smoke_hyb', 'smoke_pres_hyb',
                       'surface_pressure', 'theta', 'temp_c']:
-            arr = getattr(fhr_data, field, None)
+            arr = getattr(fhr_data, field_name, None)
             if arr is not None:
-                data[field] = arr
+                data[field_name] = arr
 
-        # Use uncompressed for fast save (~3.5GB per file, but saves in ~5s vs 60s)
         np.savez(cache_path, **data)
         self._cleanup_cache()
 
-    def _load_from_cache(self, cache_path: Path) -> Optional[ForecastHourData]:
-        """Load ForecastHourData from compressed numpy format."""
+    def _load_from_legacy_cache(self, cache_path: Path) -> Optional[ForecastHourData]:
+        """Load ForecastHourData from legacy NPZ format."""
         try:
             data = np.load(cache_path)
 
@@ -358,17 +396,129 @@ class InteractiveCrossSection:
                 lons=data['lons'],
             )
 
-            # Load optional arrays
-            for field in ['temperature', 'u_wind', 'v_wind', 'rh', 'omega',
+            for field_name in ['temperature', 'u_wind', 'v_wind', 'rh', 'omega',
                           'specific_humidity', 'geopotential_height', 'vorticity',
                           'cloud', 'dew_point', 'smoke_hyb', 'smoke_pres_hyb',
                           'surface_pressure', 'theta', 'temp_c']:
-                if field in data:
-                    setattr(fhr_data, field, data[field])
+                if field_name in data:
+                    setattr(fhr_data, field_name, data[field_name])
 
             return fhr_data
         except Exception as e:
-            print(f"Error loading from cache: {e}")
+            print(f"Error loading from legacy cache: {e}")
+            return None
+
+    # --- Mmap cache (per-field .npy files in float16) ---
+
+    # Fields saved as float16 (3.3 decimal digits — sufficient for visualization)
+    _FLOAT16_FIELDS = {
+        'temperature', 'u_wind', 'v_wind', 'rh', 'omega',
+        'specific_humidity', 'vorticity', 'cloud', 'dew_point',
+        'surface_pressure', 'theta', 'temp_c',
+        'smoke_hyb', 'smoke_pres_hyb',
+    }
+    # Fields kept at float32 (need precision for derived calculations)
+    _FLOAT32_FIELDS = {'geopotential_height'}
+    # Coordinate fields kept at float64 (tiny, loaded into RAM)
+    _COORD_FIELDS = {'pressure_levels', 'lats', 'lons'}
+
+    def _save_to_mmap_cache(self, fhr_data: ForecastHourData, cache_dir: Path):
+        """Save ForecastHourData as per-field .npy files for memory-mapped access.
+
+        3D fields saved as float16 (~half disk size vs float64).
+        geopotential_height saved as float32 (needed for shear/lapse_rate precision).
+        Coordinate arrays saved as float64 (tiny, loaded into RAM).
+        _complete marker written last for atomic cache creation.
+        """
+        import shutil
+
+        # Write to temp directory, rename when done (atomic)
+        tmp_dir = Path(str(cache_dir) + '._partial')
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True)
+
+        try:
+            # Save forecast_hour as metadata
+            np.save(tmp_dir / 'meta.npy', np.array([fhr_data.forecast_hour]))
+
+            # Save coordinate fields (float64, tiny)
+            for field_name in self._COORD_FIELDS:
+                arr = getattr(fhr_data, field_name, None)
+                if arr is not None:
+                    np.save(tmp_dir / f'{field_name}.npy', arr)
+
+            # Save float16 fields
+            for field_name in self._FLOAT16_FIELDS:
+                arr = getattr(fhr_data, field_name, None)
+                if arr is not None:
+                    # Read from mmap if needed before converting
+                    if isinstance(arr, np.memmap):
+                        arr = np.array(arr)
+                    np.save(tmp_dir / f'{field_name}.npy', arr.astype(np.float16))
+
+            # Save float32 fields
+            for field_name in self._FLOAT32_FIELDS:
+                arr = getattr(fhr_data, field_name, None)
+                if arr is not None:
+                    if isinstance(arr, np.memmap):
+                        arr = np.array(arr)
+                    np.save(tmp_dir / f'{field_name}.npy', arr.astype(np.float32))
+
+            # Write _complete marker last — cache only valid if this exists
+            (tmp_dir / '_complete').touch()
+
+            # Atomic rename: remove old dir if exists, rename temp into place
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            tmp_dir.rename(cache_dir)
+
+            self._cleanup_cache()
+        except Exception as e:
+            # Clean up partial write
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            raise e
+
+    def _load_from_mmap_cache(self, cache_dir: Path) -> Optional[ForecastHourData]:
+        """Load ForecastHourData with memory-mapped .npy files.
+
+        Coordinate arrays (pressure_levels, lats, lons) are loaded into RAM (~30KB).
+        All 3D fields are opened with mmap_mode='r' — just file handles, no data read.
+        Actual data is read from NVMe on demand when cross-section slices specific levels.
+        """
+        try:
+            if not (cache_dir / '_complete').exists():
+                return None
+
+            meta = np.load(cache_dir / 'meta.npy')
+            forecast_hour = int(meta[0])
+
+            # Coordinate arrays: load fully into RAM (tiny)
+            pressure_levels = np.load(cache_dir / 'pressure_levels.npy')
+            lats = np.load(cache_dir / 'lats.npy')
+            lons = np.load(cache_dir / 'lons.npy')
+
+            fhr_data = ForecastHourData(
+                forecast_hour=forecast_hour,
+                pressure_levels=pressure_levels,
+                lats=lats,
+                lons=lons,
+            )
+
+            # Memory-map all field files (no data read, just file handles)
+            all_fields = self._FLOAT16_FIELDS | self._FLOAT32_FIELDS
+            for field_name in all_fields:
+                npy_path = cache_dir / f'{field_name}.npy'
+                if npy_path.exists():
+                    setattr(fhr_data, field_name, np.load(npy_path, mmap_mode='r'))
+
+            # Touch _complete to update access time for LRU eviction
+            (cache_dir / '_complete').touch()
+
+            return fhr_data
+        except Exception as e:
+            print(f"Error loading from mmap cache: {e}")
             return None
 
     def _load_smoke_from_wrfnat(self, nat_file: str) -> Optional[tuple]:
@@ -436,8 +586,59 @@ class InteractiveCrossSection:
 
         return smoke_hyb, pres_hyb
 
+    def _validate_fhr_data(self, fhr_data: ForecastHourData) -> Optional[str]:
+        """Validate ForecastHourData. Returns error message or None if valid."""
+        n_levels = len(fhr_data.pressure_levels)
+        if n_levels < 40:
+            return f"only {n_levels} levels (expected 40)"
+        if fhr_data.surface_pressure is None:
+            return "missing surface_pressure (needed for terrain)"
+        return None
+
+    def _discard_cache(self, path: Path, reason: str):
+        """Remove a stale cache entry (file or directory)."""
+        import shutil
+        print(f"  Cache {reason}, discarding stale cache: {path.name}")
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+
+    def _backfill_smoke(self, fhr_data: ForecastHourData, grib_file: str, mmap_cache_dir: Optional[Path] = None):
+        """Backfill smoke from wrfnat into ForecastHourData and update cache."""
+        if fhr_data.smoke_hyb is not None:
+            return
+        nat_file = Path(grib_file).parent / Path(grib_file).name.replace('wrfprs', 'wrfnat')
+        if not nat_file.exists():
+            return
+        print(f"  Backfilling smoke from wrfnat...")
+        try:
+            result = self._load_smoke_from_wrfnat(str(nat_file))
+            if result is None:
+                return
+            smoke_hyb, smoke_pres_hyb = result
+            print(f"  Loaded PM2.5 smoke on {smoke_hyb.shape[0]} hybrid levels "
+                  f"(max={np.nanmax(smoke_hyb):.1f} μg/m³)")
+            # For mmap caches, write smoke .npy files directly into the cache dir
+            if mmap_cache_dir and mmap_cache_dir.is_dir():
+                np.save(mmap_cache_dir / 'smoke_hyb.npy', smoke_hyb.astype(np.float16))
+                np.save(mmap_cache_dir / 'smoke_pres_hyb.npy', smoke_pres_hyb.astype(np.float16))
+                # Re-open as mmap for consistency
+                fhr_data.smoke_hyb = np.load(mmap_cache_dir / 'smoke_hyb.npy', mmap_mode='r')
+                fhr_data.smoke_pres_hyb = np.load(mmap_cache_dir / 'smoke_pres_hyb.npy', mmap_mode='r')
+                print(f"  Updated mmap cache with smoke data")
+            else:
+                fhr_data.smoke_hyb = smoke_hyb
+                fhr_data.smoke_pres_hyb = smoke_pres_hyb
+        except Exception as e:
+            print(f"  Warning: Could not backfill smoke: {e}")
+
     def load_forecast_hour(self, grib_file: str, forecast_hour: int, progress_callback=None) -> bool:
-        """Load all fields for a forecast hour into memory.
+        """Load all fields for a forecast hour.
+
+        Load order: mmap cache dir → legacy .npz cache → GRIB file.
+        New saves always go to mmap format. Legacy .npz caches work indefinitely
+        but are not updated — they convert to mmap when the FHR is reloaded from GRIB.
 
         Args:
             grib_file: Path to wrfprs GRIB2 file
@@ -449,51 +650,62 @@ class InteractiveCrossSection:
         """
         cb = progress_callback or (lambda s, t, d: None)
 
-        # Check cache first
-        cache_path = self._get_cache_path(grib_file)
-        if cache_path and cache_path.exists():
-            cb(1, 2, "Loading from cache...")
-            print(f"Loading F{forecast_hour:02d} from cache...")
+        # --- Try mmap cache first ---
+        mmap_dir = self._get_mmap_cache_dir(grib_file)
+        if mmap_dir and mmap_dir.is_dir():
+            cb(1, 2, "Loading from mmap cache...")
+            print(f"Loading F{forecast_hour:02d} from mmap cache...")
             start = time.time()
-            fhr_data = self._load_from_cache(cache_path)
+            fhr_data = self._load_from_mmap_cache(mmap_dir)
             if fhr_data is not None:
-                n_levels = len(fhr_data.pressure_levels)
-                has_surface_p = fhr_data.surface_pressure is not None
-                if n_levels < 40:
-                    print(f"  Cache has only {n_levels} levels (expected 40), discarding stale cache")
-                    cache_path.unlink(missing_ok=True)
-                    fhr_data = None
-                elif not has_surface_p:
-                    print(f"  Cache missing surface_pressure (needed for terrain), discarding stale cache")
-                    cache_path.unlink(missing_ok=True)
+                err = self._validate_fhr_data(fhr_data)
+                if err:
+                    self._discard_cache(mmap_dir, err)
                     fhr_data = None
             if fhr_data is not None:
-                # Backfill smoke if missing from cache but wrfnat now available
-                if fhr_data.smoke_hyb is None:
-                    nat_file = Path(grib_file).parent / Path(grib_file).name.replace('wrfprs', 'wrfnat')
-                    if nat_file.exists():
-                        print(f"  Backfilling smoke from wrfnat...")
-                        try:
-                            result = self._load_smoke_from_wrfnat(str(nat_file))
-                            if result is not None:
-                                fhr_data.smoke_hyb, fhr_data.smoke_pres_hyb = result
-                                print(f"  Loaded PM2.5 smoke on {fhr_data.smoke_hyb.shape[0]} hybrid levels "
-                                      f"(max={np.nanmax(fhr_data.smoke_hyb):.1f} μg/m³)")
-                                # Update cache with smoke included
-                                try:
-                                    self._save_to_cache(fhr_data, cache_path)
-                                    print(f"  Updated cache with smoke data")
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            print(f"  Warning: Could not backfill smoke: {e}")
+                self._backfill_smoke(fhr_data, grib_file, mmap_cache_dir=mmap_dir)
+                self.forecast_hours[forecast_hour] = fhr_data
+                duration = time.time() - start
+                print(f"  Loaded F{forecast_hour:02d} from mmap cache in {duration:.3f}s ({fhr_data.memory_usage_mb():.0f} MB heap)")
+                cb(2, 2, "Done")
+                return True
+
+        # --- Fallback: legacy .npz cache ---
+        legacy_path = self._get_legacy_cache_path(grib_file)
+        if legacy_path and legacy_path.exists():
+            cb(1, 2, "Loading from cache...")
+            print(f"Loading F{forecast_hour:02d} from legacy cache...")
+            start = time.time()
+            fhr_data = self._load_from_legacy_cache(legacy_path)
+            if fhr_data is not None:
+                err = self._validate_fhr_data(fhr_data)
+                if err:
+                    self._discard_cache(legacy_path, err)
+                    fhr_data = None
+            if fhr_data is not None:
+                # Migrate legacy cache to mmap format
+                if mmap_dir:
+                    try:
+                        print(f"  Migrating to mmap cache...")
+                        self._save_to_mmap_cache(fhr_data, mmap_dir)
+                        # Re-load as mmap to get memory-mapped arrays
+                        fhr_data_mmap = self._load_from_mmap_cache(mmap_dir)
+                        if fhr_data_mmap is not None:
+                            fhr_data = fhr_data_mmap
+                            # Remove legacy .npz
+                            legacy_path.unlink(missing_ok=True)
+                            print(f"  Migrated to mmap, removed legacy .npz")
+                    except Exception as e:
+                        print(f"  Warning: Could not migrate to mmap: {e}")
+                self._backfill_smoke(fhr_data, grib_file,
+                                     mmap_cache_dir=mmap_dir if mmap_dir and mmap_dir.is_dir() else None)
                 self.forecast_hours[forecast_hour] = fhr_data
                 duration = time.time() - start
                 print(f"  Loaded F{forecast_hour:02d} from cache in {duration:.1f}s ({fhr_data.memory_usage_mb():.0f} MB)")
                 cb(2, 2, "Done")
                 return True
 
-        # Field names for progress reporting
+        # --- Load from GRIB ---
         field_labels = {
             't': 'Temperature', 'u': 'U-Wind', 'v': 'V-Wind', 'r': 'RH',
             'w': 'Omega', 'q': 'Sp. Humidity', 'gh': 'Geopotential',
@@ -621,12 +833,9 @@ class InteractiveCrossSection:
                     fhr_data.temp_c = fhr_data.temperature - 273.15
 
                 # Validate before storing — don't cache incomplete data
-                n_levels = len(fhr_data.pressure_levels)
-                if n_levels < 40:
-                    print(f"  WARNING: Only got {n_levels}/40 pressure levels — GRIB may be incomplete, skipping")
-                    return False
-                if fhr_data.surface_pressure is None:
-                    print(f"  WARNING: No surface pressure loaded — wrfsfc may be missing, skipping")
+                err = self._validate_fhr_data(fhr_data)
+                if err:
+                    print(f"  WARNING: {err} — GRIB may be incomplete, skipping")
                     return False
 
                 # Store
@@ -636,11 +845,11 @@ class InteractiveCrossSection:
                 mem_mb = fhr_data.memory_usage_mb()
                 print(f"  Loaded F{forecast_hour:02d} in {duration:.1f}s ({mem_mb:.0f} MB)")
 
-                # Save to cache for fast subsequent loads
-                if cache_path:
+                # Save to mmap cache for fast subsequent loads
+                if mmap_dir:
                     try:
-                        self._save_to_cache(fhr_data, cache_path)
-                        print(f"  Cached to {cache_path.name}")
+                        self._save_to_mmap_cache(fhr_data, mmap_dir)
+                        print(f"  Cached to {mmap_dir.name}/ (mmap)")
                     except Exception as e:
                         print(f"  Warning: Could not cache: {e}")
 
@@ -1173,6 +1382,14 @@ class InteractiveCrossSection:
         lats_grid = fhr_data.lats
         lons_grid = fhr_data.lons
 
+        def _ensure_float32(arr):
+            """Cast float16/memmap to float32 for scipy interpolation."""
+            if arr.dtype == np.float16:
+                return np.array(arr, dtype=np.float32)
+            if isinstance(arr, np.memmap):
+                return np.array(arr)  # read from disk into RAM
+            return arr
+
         # Build interpolator (curvilinear vs regular grid)
         if lats_grid.ndim == 2:
             # Curvilinear grid - use KDTree
@@ -1184,11 +1401,12 @@ class InteractiveCrossSection:
             def interp_3d(field_3d):
                 result = np.full((n_levels, n_points), np.nan)
                 for lev in range(min(field_3d.shape[0], n_levels)):
-                    result[lev, :] = field_3d[lev].ravel()[indices]
+                    level_data = _ensure_float32(field_3d[lev])
+                    result[lev, :] = level_data.ravel()[indices]
                 return result
 
             def interp_2d(field_2d):
-                return field_2d.ravel()[indices]
+                return _ensure_float32(field_2d).ravel()[indices]
         else:
             # Regular grid - use bilinear interpolation
             lats_1d = lats_grid if lats_grid.ndim == 1 else lats_grid[:, 0]
@@ -1198,16 +1416,18 @@ class InteractiveCrossSection:
             def interp_3d(field_3d):
                 result = np.full((n_levels, n_points), np.nan)
                 for lev in range(min(field_3d.shape[0], n_levels)):
+                    level_data = _ensure_float32(field_3d[lev])
                     interp = RegularGridInterpolator(
-                        (lats_1d, lons_1d), field_3d[lev],
+                        (lats_1d, lons_1d), level_data,
                         method='linear', bounds_error=False, fill_value=np.nan
                     )
                     result[lev, :] = interp(pts)
                 return result
 
             def interp_2d(field_2d):
+                level_data = _ensure_float32(field_2d)
                 interp = RegularGridInterpolator(
-                    (lats_1d, lons_1d), field_2d,
+                    (lats_1d, lons_1d), level_data,
                     method='linear', bounds_error=False, fill_value=np.nan
                 )
                 return interp(pts)
@@ -1245,16 +1465,17 @@ class InteractiveCrossSection:
             path_lats_hires = np.linspace(path_lats[0], path_lats[-1], terrain_res)
             path_lons_hires = np.linspace(path_lons[0], path_lons[-1], terrain_res)
 
+            sp_f32 = _ensure_float32(fhr_data.surface_pressure)
             if lats_grid.ndim == 2:
                 # Curvilinear - use same tree
                 tgt_pts_hires = np.column_stack([path_lats_hires, path_lons_hires])
                 _, indices_hires = tree.query(tgt_pts_hires, k=1)
-                sp_hires = fhr_data.surface_pressure.ravel()[indices_hires]
+                sp_hires = sp_f32.ravel()[indices_hires]
             else:
                 # Regular grid - bilinear interpolation
                 pts_hires = np.column_stack([path_lats_hires, path_lons_hires])
                 interp_sp = RegularGridInterpolator(
-                    (lats_1d, lons_1d), fhr_data.surface_pressure,
+                    (lats_1d, lons_1d), sp_f32,
                     method='linear', bounds_error=False, fill_value=np.nan
                 )
                 sp_hires = interp_sp(pts_hires)

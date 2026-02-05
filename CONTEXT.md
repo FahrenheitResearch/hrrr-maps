@@ -10,16 +10,16 @@ Live at **wxsection.com** via Cloudflare Tunnel (`cloudflared` running in WSL).
 ### What Works
 - **Dashboard**: `tools/unified_dashboard.py` - Flask + Leaflet interactive map
 - **Cross-section engine**: `core/cross_section_interactive.py` - Sub-second generation
-- **NPZ caching**: `cache/dashboard/xsect/` (~2s per hour from cache vs 25s from GRIB, 400GB limit with eviction)
+- **Mmap caching**: `cache/dashboard/xsect/` — per-field .npy files in float16, memory-mapped (~12ms "load" vs 2s old NPZ, ~2.3GB/FHR vs 3.7GB, 400GB limit with eviction). OS page cache manages physical RAM automatically. Legacy .npz caches auto-migrate on first load
 - **15 styles**: wind_speed, temp, theta_e, rh, q, omega, vorticity, shear, lapse_rate, cloud, cloud_total, wetbulb, icing, frontogenesis, smoke
 - **Anomaly/departure mode**: "Raw / 5yr Dep" toggle subtracts 5-year HRRR climatological mean from current forecast. RdBu_r diverging colormap centered at 0. Works for 10 anomaly-eligible styles (temp, wind_speed, rh, omega, theta_e, q, vorticity, shear, lapse_rate, wetbulb). Requires pre-built climatology NPZ files
 - **Climatology pipeline**: `tools/build_climatology.py` builds monthly mean NPZ files from archived HRRR data. Coarsened grid (every 5th point, 212x360 vs 1059x1799, ~15km). ~30MB per file. Nearest-FHR fallback (FHR 01 uses FHR 00's climo, FHR 02 uses FHR 03's, etc.)
 - **Color-coded chip UI**: Grey (on disk) / Green (in RAM) / Blue (viewing) / Yellow (loading) / Shift+click to unload
 - **Plot annotations**: A/B labels, ~100+ city labels, lat/lon secondary axis, legend box, inset map with A/B badges
 - **Distance units**: km/mi toggle at render time
-- **Every-3rd-hour preloading**: F00, F03, F06, F09, F12, F15, F18 loaded to RAM for latest 2 cycles (~52-62GB) via 2 parallel workers with startup progress bar. Newest cycle loads first. Other hours load on-demand. Loading mutex prevents preload/auto-load/Load All from overlapping
+- **Every-3rd-hour preloading**: F00, F03, F06, F09, F12, F15, F18 opened for latest 2 cycles via 2 parallel workers with startup progress bar. Mmap FHRs use ~29MB heap each (coordinates only) — OS page cache handles the rest. Newest cycle loads first. Other hours load on-demand. Loading mutex prevents preload/auto-load/Load All from overlapping
 - **Auto-load**: Background thread (every 60s) detects new FHRs downloaded for latest 2 cycles and loads matching PRELOAD_FHRS into RAM automatically — no restart needed
-- **Smart memory management**: 117GB hard cap, LRU eviction at 115GB. Latest 2 cycles are protected from eviction
+- **Smart memory management**: 117GB hard cap, LRU eviction at 115GB. Latest 2 cycles are protected from eviction. With mmap cache, heap usage is ~29MB per FHR (coordinate arrays only), so hundreds of FHRs fit simultaneously — eviction rarely triggers
 - **Render semaphore**: Limits concurrent matplotlib renders to 4, returns 503 if queue full (10s timeout for single, 30s for GIF)
 - **Disk management**: 500GB GRIB limit + 400GB NPZ cache limit with separate eviction
 - **Auto-update daemon**: `tools/auto_update.py` downloads latest cycles continuously
@@ -71,11 +71,12 @@ tools/unified_dashboard.py
 - **Admin key**: `WXSECTION_KEY` env var checked via `check_admin_key()` against `?key=` query param or `X-Admin-Key` header (with `.strip()`). Gates: `/api/load` (archive cycles), `/api/load_cycle` (archive), `/api/unload` (protected cycles), `/api/request_cycle` (all downloads), full-frame GIF, Load All button visibility. `/api/check_key` validates key and returns protected cycle list
 - **Protected cycles**: `get_protected_cycles()` returns newest 2 cycle keys from `available_cycles`. Eviction skips these. Unload rejects non-admin requests for these
 - **Auto-load**: `auto_load_latest()` called every 60s from background rescan thread. Checks latest 2 cycles for PRELOAD_FHRS on disk but not in RAM, loads with 2 parallel workers. Skips gracefully if `_loading` mutex is held by preload or load_cycle
-- **Smoke loading**: Uses eccodes (not cfgrib) to read MASSDEN (disc=0, cat=20, num=0) from wrfnat — cfgrib can't identify this field (shows as `unknown`). Kept on **native hybrid levels** (50 levels, ~10-15 packed in lowest 2km) with per-column pressure coordinate — NOT interpolated to isobaric. This preserves boundary layer vertical detail where smoke concentrates. Stored as `smoke_hyb` + `smoke_pres_hyb` in ForecastHourData and NPZ cache. Units: kg/m³ × 10⁹ = μg/m³. Plotted with its own X/Y mesh (pressure varies per column due to terrain).
-- **Smoke backfill**: When loading from NPZ cache, if `smoke_hyb` is missing but wrfnat file exists, smoke is automatically loaded from wrfnat and cache is updated. Handles transition from pre-smoke caches.
+- **Mmap cache format**: Per-FHR directory with individual `.npy` files. 3D fields stored as float16 (~half disk), geopotential_height as float32 (needs precision for shear/lapse_rate). Coordinate arrays (lats, lons, pressure_levels) loaded as float64 into RAM (~29MB). `_complete` marker file written last for atomic cache creation. `np.load(path, mmap_mode='r')` opens file handles without reading data — OS page cache manages which pages stay in physical RAM. `_ensure_float32()` helper casts float16/memmap to float32 before scipy interpolation. Legacy .npz caches auto-migrate to mmap format on first load (one-time ~15s cost per FHR), then legacy file is deleted
+- **Smoke loading**: Uses eccodes (not cfgrib) to read MASSDEN (disc=0, cat=20, num=0) from wrfnat — cfgrib can't identify this field (shows as `unknown`). Kept on **native hybrid levels** (50 levels, ~10-15 packed in lowest 2km) with per-column pressure coordinate — NOT interpolated to isobaric. This preserves boundary layer vertical detail where smoke concentrates. Stored as `smoke_hyb` + `smoke_pres_hyb` in ForecastHourData and mmap cache. Units: kg/m³ × 10⁹ = μg/m³. Plotted with its own X/Y mesh (pressure varies per column due to terrain).
+- **Smoke backfill**: When loading from cache, if `smoke_hyb` is missing but wrfnat file exists, smoke is loaded from wrfnat. For mmap caches, smoke .npy files are written directly into the cache directory and re-opened as mmap
 - **Atomic downloads**: `download_grib_file()` writes to `.partial` temp file, then atomically renames to final path. Prevents readers from seeing half-written GRIBs. All download paths (auto_update, bulk_download, request_cycle) use this.
 - **FHR availability gating**: `scan_available_cycles()` requires BOTH `*wrfprs*.grib2` AND `*wrfsfc*.grib2` to exist (and not `.partial`) before considering an FHR available. Prevents loading without surface pressure.
-- **Stale cache validation**: On NPZ load, cache is discarded if pressure levels < 40 (expected 40) OR surface_pressure is missing. GRIB loading also validates 40 levels + surface_pressure before storing/caching — returns False if incomplete. Previously used `< 35` threshold which let 37-39 level caches slip through.
+- **Stale cache validation**: On cache load (mmap or legacy NPZ), `_validate_fhr_data()` checks pressure levels < 40 (expected 40) OR surface_pressure missing. Stale caches are discarded via `_discard_cache()` (handles both files and directories). GRIB loading also validates before storing/caching — returns False if incomplete
 - **Terrain mask bug (fixed Feb 5 2026)**: `urlretrieve` wrote GRIBs directly to final path with no temp file. Auto-load picked up half-written files → cfgrib read partial data → truncated pressure levels (2-39 out of 40) and/or missing surface_pressure → poisoned NPZ cache permanently. Found 23 stale caches on disk. Fixed with atomic downloads + wrfsfc gating + tightened validation.
 - **Duplicate prevention**: All 4 `loaded_items.append()` sites (preload, auto-load, load_cycle, load_forecast_hour) check `if (cycle_key, fhr) not in self.loaded_items` before appending, preventing race condition duplicates
 - **Loading mutex**: `self._loading` lock (threading.Lock) prevents preload, auto-load, and load_cycle from running simultaneously. Preload and load_cycle block on it; auto-load skips if locked. Prevents resource thrashing on startup
@@ -150,7 +151,7 @@ ingress:
 
 ### Data Locations
 - **Live GRIB files**: `outputs/hrrr/YYYYMMDD/HHz/F##/` (auto-update writes here, 500GB limit)
-- **NPZ cache**: `cache/dashboard/xsect/` (400GB limit with eviction)
+- **Mmap cache**: `cache/dashboard/xsect/` (per-field .npy dirs + legacy .npz, 400GB limit with eviction)
 - **Archive GRIBs**: `/mnt/hrrr/YYYYMMDD/HHz/F##/` (VHD, bulk_download.py writes here)
 - **Climatology NPZ**: `/mnt/hrrr/climatology/climo_MM_HHz_FNN.npz` (~30MB each)
 - **Favorites**: `data/favorites.json`
