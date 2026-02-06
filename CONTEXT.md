@@ -100,28 +100,37 @@ NVMe cache eviction — two-tier (cache_evict_old_cycles):
   - Budget: ~425GB preload window + ~245GB archive headroom
 ```
 
-### Auto-Update (HRRR-Priority Batched)
+### Auto-Update (Slot-Based Concurrent)
 ```
-HRRR_BATCH_SIZE = 5  — download up to 5 HRRR FHRs, then yield
+Slot-based concurrency via ThreadPoolExecutor + wait(FIRST_COMPLETED):
+  --hrrr-slots 3   (3 HRRR FHRs downloading in parallel)
+  --gfs-slots 1    (1 GFS FHR at a time)
+  --rrfs-slots 1   (1 RRFS FHR at a time)
+  Total: 5 concurrent NOMADS/AWS connections
 
-Loop:
-  1. HRRR batch: download up to 5 FHRs from HRRR queue
-     - If a download fails (FHR not published yet), immediately yield
-     - Prunes higher FHRs from same cycle (won't be available either)
-     - When queue empties, re-scan NOMADS for newly published FHRs
-  2. Non-HRRR round: one FHR per model (GFS, RRFS round-robin)
-     - When HRRR has no work, this runs every iteration = full bandwidth
-  3. Repeat until all queues empty, then sleep 30s and re-scan
+Each model runs in its own lane — slow RRFS can't block HRRR.
+HRRR fail-fast: if Fxx fails, prunes higher FHRs from same cycle.
+HRRR refresh: re-scans for newly published FHRs every 45s while
+  other models are still downloading.
 
 Cycle targeting:
   - HRRR: latest 2 cycles (for base FHRs)
   - GFS/RRFS: latest cycle only (no handoff)
+
+Download throughput (~6-7 MB/s per NOMADS connection):
+  HRRR: 1.17GB/FHR (wrfprs 375MB + wrfsfc 138MB + wrfnat 652MB) ~170s/FHR
+  GFS:  516MB/FHR (pgrb2.0p25)                                   ~83s/FHR
+  RRFS: 795MB/FHR (prslev)                                       ~124s/FHR
+  Total bandwidth at 3+1+1: ~265 Mbps sustained
+
+Bottleneck: NOMADS per-connection speed (~6-7 MB/s), not local bandwidth.
+Safe to bump to ~7-8 total connections before NOMADS may throttle.
 ```
 
 ### Memory Architecture
 - **Mmap cache per FHR**: 2.3GB on disk (40 levels x 1059 x 1799 x 14 float16/32 fields)
 - **Resident RAM per FHR**: ~100MB (mmap only pages in accessed slices)
-- **174 FHRs loaded**: ~4-6GB RAM, ~400GB on disk
+- **~125 FHRs loaded**: ~4-6GB RAM, ~290GB on disk
 - **Heap per FHR**: ~29MB (lats+lons coordinate arrays)
 - **Memory limits**: 48GB HRRR hard cap, 8GB each GFS/RRFS
 
@@ -165,7 +174,7 @@ HRRR synoptic (49 FHR): ~61GB GRIB, ~113GB cache
 - **Archive requests**: Modal with date picker, hour selector, FHR range (admin-gated)
 - **Download progress**: Shows in-flight FHRs in real-time (`Downloading F00, F01, F02, F03 from AWS archive...`)
 - **Cancel jobs**: Admin can cancel pre-render and download operations via X button in progress panel
-- **Auto-update**: HRRR-priority batched (5 FHRs then yield), fail-fast on unavailable, GFS/RRFS latest-only targeting
+- **Auto-update**: Slot-based concurrent (3 HRRR + 1 GFS + 1 RRFS in parallel), fail-fast on unavailable, HRRR refresh every 45s
 - **Cache-first preload**: Cached FHRs load in <1s total, GRIB conversions run in background
 - **Time slider + auto-play**: 0.5x-4x speed, pre-render for instant scrubbing
 - **Frame prerender cache**: 500-entry server-side cache
@@ -187,7 +196,7 @@ start.sh                           # Startup script (mount VHD, start services)
 model_config.py                     # Model registry (HRRR/GFS/RRFS metadata)
 core/cross_section_interactive.py   # Main engine — mmap cache, cartopy cache, KDTree cache
 smart_hrrr/orchestrator.py          # Parallel GRIB downloads (on_complete, on_start, should_cancel)
-tools/auto_update.py                # HRRR-priority interleaved download daemon
+tools/auto_update.py                # Slot-based concurrent download daemon
 tools/unified_dashboard.py          # Flask dashboard — everything UI + API
 ```
 
@@ -200,7 +209,11 @@ CACHE_LIMIT_GB = 670   # ~290GB preload + ~380GB archive headroom
 RENDER_SEMAPHORE = 12  # 8 prerender + 4 live user requests
 PRERENDER_WORKERS = 8  # Parallel threads for batch prerender
 HRRR_HOURLY_CYCLES = 3
-HRRR_BATCH_SIZE = 5    # auto_update.py: HRRR FHRs per batch before yielding
+
+# auto_update.py (slot-based concurrent)
+HRRR_SLOTS = 3         # --hrrr-slots: concurrent HRRR downloads
+GFS_SLOTS = 1          # --gfs-slots: concurrent GFS downloads
+RRFS_SLOTS = 1         # --rrfs-slots: concurrent RRFS downloads
 ```
 
 ---

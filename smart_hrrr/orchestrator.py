@@ -10,13 +10,57 @@ import urllib.request
 import urllib.error
 import socket
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from model_config import get_model_registry
 from .io import create_output_structure, get_forecast_hour_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_source(url: str) -> str:
+    """Classify URL source for logging and source-priority ordering."""
+    u = (url or "").lower()
+    if "nomads.ncep.noaa.gov" in u:
+        return "nomads"
+    if "ftpprd.ncep.noaa.gov" in u:
+        return "ftpprd"
+    if "s3.amazonaws.com" in u or "noaa-" in u:
+        return "aws"
+    if "pando" in u:
+        return "pando"
+    return "other"
+
+
+def _source_display_name(source: str) -> str:
+    names = {
+        "nomads": "NOMADS",
+        "ftpprd": "NCEP FTPPRD",
+        "aws": "AWS",
+        "pando": "Pando",
+        "other": "Source",
+    }
+    return names.get(source, "Source")
+
+
+def _apply_source_preference(urls: List[str], source_preference: Optional[List[str]] = None) -> List[str]:
+    """Reorder URLs based on preferred source list.
+
+    source_preference examples:
+      ['aws', 'pando', 'nomads']
+      ['ftpprd', 'nomads']
+    """
+    if not source_preference:
+        return urls
+    order = {src.lower(): idx for idx, src in enumerate(source_preference)}
+    ranked = []
+    for original_idx, url in enumerate(urls):
+        src = _detect_source(url)
+        rank = order.get(src, len(order))
+        ranked.append((rank, original_idx, url))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    return [url for _, _, url in ranked]
 
 
 def download_grib_file(url: str, output_path: Path, timeout: int = 600) -> bool:
@@ -44,7 +88,8 @@ def download_forecast_hour(
     cycle_hour: int,
     forecast_hour: int,
     output_dir: Path,
-    file_types: List[str] = None
+    file_types: List[str] = None,
+    source_preference: Optional[List[str]] = None,
 ) -> bool:
     """Download GRIB files for a single forecast hour."""
 
@@ -59,26 +104,28 @@ def download_forecast_hour(
         return False
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    success = False
+    all_file_types_ok = True
 
     for file_type in file_types:
         filename = model_config.get_filename(cycle_hour, file_type, forecast_hour)
         output_path = output_dir / filename
+        file_ok = False
 
         if output_path.exists():
             logger.debug(f"File exists: {filename}")
-            success = True
+            file_ok = True
             continue
 
         urls = model_config.get_download_urls(date_str, cycle_hour, file_type, forecast_hour)
+        urls = _apply_source_preference(urls, source_preference)
 
         for i, url in enumerate(urls):
-            source = "NOMADS" if "nomads" in url else "AWS" if "s3.amazonaws" in url or "noaa-" in url else "Pando"
+            source = _source_display_name(_detect_source(url))
             logger.info(f"Downloading {filename} from {source}...")
 
             if download_grib_file(url, output_path):
                 logger.info(f"Downloaded {filename}")
-                success = True
+                file_ok = True
                 break
             else:
                 if i < len(urls) - 1:
@@ -86,7 +133,10 @@ def download_forecast_hour(
                 else:
                     logger.error(f"Failed to download {filename} from all sources")
 
-    return success
+        if not file_ok:
+            all_file_types_ok = False
+
+    return all_file_types_ok
 
 
 def download_gribs_parallel(
@@ -100,6 +150,7 @@ def download_gribs_parallel(
     on_complete=None,
     on_start=None,
     should_cancel=None,
+    source_preference: Optional[List[str]] = None,
 ) -> Dict[int, bool]:
     """Download GRIB files for multiple forecast hours in parallel.
 
@@ -122,7 +173,15 @@ def download_gribs_parallel(
             on_start(fhr)
         fhr_dir = get_forecast_hour_dir(output_base_dir, fhr)
         start = time.time()
-        ok = download_forecast_hour(model, date_str, cycle_hour, fhr, fhr_dir, file_types)
+        ok = download_forecast_hour(
+            model,
+            date_str,
+            cycle_hour,
+            fhr,
+            fhr_dir,
+            file_types=file_types,
+            source_preference=source_preference,
+        )
         dur = time.time() - start
         if ok:
             logger.info(f"  F{fhr:02d} downloaded ({dur:.1f}s)")

@@ -23,6 +23,8 @@ import sys
 import time
 import signal
 import shutil
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -44,7 +46,7 @@ SYNOPTIC_HOURS = {0, 6, 12, 18}
 
 # Per-model: which GRIB file patterns confirm a complete FHR download
 MODEL_REQUIRED_PATTERNS = {
-    'hrrr': ['*wrfprs*.grib2', '*wrfnat*.grib2'],
+    'hrrr': ['*wrfprs*.grib2', '*wrfsfc*.grib2', '*wrfnat*.grib2'],
     'gfs':  ['*pgrb2.0p25*'],
     'rrfs': ['*prslev*.grib2'],
 }
@@ -244,20 +246,20 @@ def download_single_fhr(model, date_str, hour, fhr):
 
     Returns True if successfully downloaded, False otherwise.
     """
-    from smart_hrrr.orchestrator import download_gribs_parallel
-    from smart_hrrr.io import create_output_structure
+    from smart_hrrr.orchestrator import download_forecast_hour
+    from smart_hrrr.io import create_output_structure, get_forecast_hour_dir
 
-    create_output_structure(model, date_str, hour)
+    run_dir = create_output_structure(model, date_str, hour)['run']
+    fhr_dir = get_forecast_hour_dir(run_dir, fhr)
     file_types = MODEL_FILE_TYPES.get(model, ['pressure'])
-    results = download_gribs_parallel(
+    return download_forecast_hour(
         model=model,
         date_str=date_str,
         cycle_hour=hour,
-        forecast_hours=[fhr],
-        max_threads=4,
+        forecast_hour=fhr,
+        output_dir=fhr_dir,
         file_types=file_types,
     )
-    return results.get(fhr, False)
 
 
 DISK_LIMIT_GB = 500
@@ -423,6 +425,117 @@ def run_update_cycle_for_model(model, max_hours=None):
     return total_new
 
 
+def run_download_pass_concurrent(work_queues, slot_limits, hrrr_max_fhr=None):
+    """Run one concurrent download pass.
+
+    Uses per-model slot limits (e.g., HRRR=3, GFS=1, RRFS=1) so slow RRFS
+    transfers no longer block HRRR/GFS progress.
+    """
+    global running
+
+    # Keep only models with work and at least one slot
+    queues = {
+        model: deque(items)
+        for model, items in work_queues.items()
+        if items and slot_limits.get(model, 0) > 0
+    }
+    if not queues:
+        return 0
+
+    active_by_model = {m: 0 for m in slot_limits}
+    in_flight = {}
+    total_new = 0
+    hrrr_refresh_interval_sec = 45
+    last_hrrr_refresh = 0.0
+
+    # Prefer scheduling HRRR first, then others in name order.
+    model_order = sorted(slot_limits.keys(), key=lambda m: (m != 'hrrr', m))
+    total_workers = sum(max(0, slot_limits.get(m, 0)) for m in model_order)
+    if total_workers <= 0:
+        return 0
+
+    def _drop_if_empty(model_name):
+        q = queues.get(model_name)
+        if q is not None and not q:
+            queues.pop(model_name, None)
+
+    def _schedule(model_name, pool):
+        q = queues.get(model_name)
+        if not q:
+            return
+
+        limit = max(0, slot_limits.get(model_name, 0))
+        while running and q and active_by_model.get(model_name, 0) < limit:
+            date_str, hour, fhr = q.popleft()
+            future = pool.submit(download_single_fhr, model_name, date_str, hour, fhr)
+            in_flight[future] = (model_name, date_str, hour, fhr, time.time())
+            active_by_model[model_name] = active_by_model.get(model_name, 0) + 1
+            logger.info(
+                f"[{model_name.upper()}] Downloading {date_str}/{hour:02d}z F{fhr:02d} "
+                f"(queued={len(q)}, active={active_by_model[model_name]}/{limit})"
+            )
+        _drop_if_empty(model_name)
+
+    with ThreadPoolExecutor(max_workers=total_workers) as pool:
+        while running and (queues or in_flight):
+            # Refresh HRRR queue while other models are still active so newly
+            # published hours can start without waiting for the next outer pass.
+            if (
+                slot_limits.get('hrrr', 0) > 0
+                and 'hrrr' not in queues
+                and active_by_model.get('hrrr', 0) == 0
+            ):
+                now = time.time()
+                if now - last_hrrr_refresh >= hrrr_refresh_interval_sec:
+                    last_hrrr_refresh = now
+                    refreshed = get_pending_work('hrrr', hrrr_max_fhr)
+                    if refreshed:
+                        queues['hrrr'] = deque(refreshed)
+                        logger.info(f"[HRRR] Refreshed pending queue: {len(refreshed)} FHRs")
+
+            for model_name in model_order:
+                _schedule(model_name, pool)
+
+            if not in_flight:
+                break
+
+            done, _ = wait(set(in_flight.keys()), return_when=FIRST_COMPLETED)
+            for fut in done:
+                model_name, date_str, hour, fhr, start_ts = in_flight.pop(fut)
+                active_by_model[model_name] = max(0, active_by_model.get(model_name, 0) - 1)
+                dur = time.time() - start_ts
+
+                ok = False
+                try:
+                    ok = fut.result()
+                except Exception as e:
+                    logger.warning(f"[{model_name.upper()}] Failed {date_str}/{hour:02d}z F{fhr:02d}: {e}")
+
+                if ok:
+                    total_new += 1
+                    logger.info(f"[{model_name.upper()}] F{fhr:02d} complete ({dur:.1f}s)")
+                else:
+                    logger.info(f"[{model_name.upper()}] F{fhr:02d} unavailable/failed ({dur:.1f}s)")
+                    # HRRR fail-fast: if Fxx isn't available, higher FHRs in same cycle
+                    # are generally not available either.
+                    if model_name == 'hrrr' and 'hrrr' in queues:
+                        before = len(queues['hrrr'])
+                        queues['hrrr'] = deque(
+                            (d, h, f)
+                            for d, h, f in queues['hrrr']
+                            if not (d == date_str and h == hour and f > fhr)
+                        )
+                        pruned = before - len(queues['hrrr'])
+                        if pruned > 0:
+                            logger.info(
+                                f"[HRRR] Pruned {pruned} higher FHRs after unavailable "
+                                f"{date_str}/{hour:02d}z F{fhr:02d}"
+                            )
+                        _drop_if_empty('hrrr')
+
+    return total_new
+
+
 def main():
     global running
 
@@ -435,9 +548,20 @@ def main():
     parser.add_argument("--max-hours", type=int, default=None,
                         help="Max forecast hours for HRRR (default: per-model)")
     parser.add_argument("--no-cleanup", action="store_true", help="Don't clean up old data")
+    parser.add_argument("--hrrr-slots", type=int, default=3,
+                        help="Concurrent HRRR FHR downloads (default: 3)")
+    parser.add_argument("--gfs-slots", type=int, default=1,
+                        help="Concurrent GFS FHR downloads (default: 1)")
+    parser.add_argument("--rrfs-slots", type=int, default=1,
+                        help="Concurrent RRFS FHR downloads (default: 1)")
 
     args = parser.parse_args()
     models = [m.strip().lower() for m in args.models.split(',')]
+    slot_limits = {
+        'hrrr': max(0, args.hrrr_slots),
+        'gfs': max(0, args.gfs_slots),
+        'rrfs': max(0, args.rrfs_slots),
+    }
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -448,7 +572,8 @@ def main():
     logger.info(f"Check interval: {args.interval} min")
     for m in models:
         mfhr = args.max_hours if (args.max_hours and m == 'hrrr') else MODEL_DEFAULT_MAX_FHR.get(m, 18)
-        logger.info(f"  {m.upper()}: F00-F{mfhr:02d} (base)")
+        slots = slot_limits.get(m, 1)
+        logger.info(f"  {m.upper()}: F00-F{mfhr:02d} (base), slots={slots}")
     logger.info("=" * 60)
 
     if args.once:
@@ -459,15 +584,9 @@ def main():
         logger.info(f"Downloaded {total} new forecast hours total")
         return
 
-    # --------------- Interleaved priority download loop ---------------
-    # Instead of blocking on each model sequentially, we interleave
-    # downloads one FHR at a time with HRRR getting priority:
-    #   - Refresh HRRR work queue after every non-HRRR download
-    #   - HRRR always goes first when it has pending work
-    #   - Other models share remaining bandwidth round-robin
-    # This ensures HRRR never waits for slow GFS/RRFS downloads.
-
-    HRRR_BATCH_SIZE = 5  # Download this many HRRR FHRs, then give other models a turn
+    # --------------- Concurrent slot-based download loop ---------------
+    # Each model gets dedicated concurrency slots so slow RRFS/GFS transfers
+    # cannot block HRRR progression.
     hrrr_max_fhr = args.max_hours if args.max_hours else None
 
     while running:
@@ -475,6 +594,8 @@ def main():
             # Build work queues per model
             work_queues = {}
             for model in models:
+                if slot_limits.get(model, 0) <= 0:
+                    continue
                 mfhr = hrrr_max_fhr if model == 'hrrr' else None
                 pending = get_pending_work(model, mfhr)
                 if pending:
@@ -491,74 +612,11 @@ def main():
                     time.sleep(1)
                 continue
 
-            total_new = 0
-            other_models = [m for m in models if m != 'hrrr']
-            other_idx = 0  # Round-robin index for non-HRRR models
-
-            while running and work_queues:
-                # --- HRRR batch: download up to N FHRs, then yield to others ---
-                if 'hrrr' in work_queues:
-                    hrrr_batch = 0
-                    while 'hrrr' in work_queues and hrrr_batch < HRRR_BATCH_SIZE and running:
-                        date_str, hour, fhr = work_queues['hrrr'].pop(0)
-                        logger.info(f"[HRRR] Downloading {date_str}/{hour:02d}z F{fhr:02d} "
-                                    f"({len(work_queues['hrrr'])} remaining)")
-                        try:
-                            ok = download_single_fhr('hrrr', date_str, hour, fhr)
-                            if ok:
-                                total_new += 1
-                            else:
-                                # FHR not available yet — skip remaining from this cycle
-                                # (higher FHRs won't be available either)
-                                logger.info(f"[HRRR] F{fhr:02d} not available, yielding to other models")
-                                work_queues['hrrr'] = [
-                                    (d, h, f) for d, h, f in work_queues.get('hrrr', [])
-                                    if not (d == date_str and h == hour and f > fhr)
-                                ]
-                                if not work_queues['hrrr']:
-                                    del work_queues['hrrr']
-                                break  # Yield to GFS/RRFS immediately
-                        except Exception as e:
-                            logger.warning(f"[HRRR] Failed {date_str}/{hour:02d}z F{fhr:02d}: {e}")
-                            break  # Yield on error too
-                        hrrr_batch += 1
-                        if not work_queues.get('hrrr'):
-                            if 'hrrr' in work_queues:
-                                del work_queues['hrrr']
-                            # Re-check HRRR — new FHRs may have appeared on NOMADS
-                            new_hrrr = get_pending_work('hrrr', hrrr_max_fhr)
-                            if new_hrrr:
-                                work_queues['hrrr'] = new_hrrr
-                                logger.info(f"[HRRR] Refreshed: {len(new_hrrr)} new pending FHRs")
-
-                # --- Non-HRRR: one FHR per model (round-robin) ---
-                # When HRRR is idle, this runs every iteration = full bandwidth to GFS/RRFS
-                has_other_work = False
-                if other_models:
-                    tried = 0
-                    while tried < len(other_models) and running:
-                        model = other_models[other_idx % len(other_models)]
-                        other_idx += 1
-                        tried += 1
-                        if model not in work_queues:
-                            continue
-
-                        has_other_work = True
-                        date_str, hour, fhr = work_queues[model].pop(0)
-                        logger.info(f"[{model.upper()}] Downloading {date_str}/{hour:02d}z F{fhr:02d} "
-                                    f"({len(work_queues[model])} remaining)")
-                        try:
-                            ok = download_single_fhr(model, date_str, hour, fhr)
-                            if ok:
-                                total_new += 1
-                        except Exception as e:
-                            logger.warning(f"[{model.upper()}] Failed {date_str}/{hour:02d}z F{fhr:02d}: {e}")
-                        if not work_queues[model]:
-                            del work_queues[model]
-
-                # Nothing left anywhere
-                if not work_queues:
-                    break
+            total_new = run_download_pass_concurrent(
+                work_queues=work_queues,
+                slot_limits=slot_limits,
+                hrrr_max_fhr=hrrr_max_fhr,
+            )
 
             if total_new > 0:
                 logger.info(f"Total new downloads this pass: {total_new}")

@@ -75,12 +75,14 @@ XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=your_key python tools/unified_dashboard.
   - Tier 2: Archive request caches persist up to 670GB limit, oldest evicted first when over
 - **Per-model memory budgets**: HRRR 48GB, GFS 8GB, RRFS 8GB
 
-### Auto-Update (HRRR-Priority Batched)
-- **Batched interleaving** - HRRR downloads in batches of 5, then yields to GFS/RRFS round-robin
-- **Fail-fast on unavailable FHRs** - if an HRRR FHR isn't published yet, immediately yields to other models
-- **GFS/RRFS get full bandwidth** when HRRR is caught up (no batch gating)
+### Auto-Update (Slot-Based Concurrent)
+- **Parallel download slots** - 3 HRRR + 1 GFS + 1 RRFS downloading simultaneously via ThreadPoolExecutor
+- **Per-model lanes** - slow RRFS downloads can't block HRRR/GFS progress
+- **HRRR fail-fast** - unavailable FHRs prune higher FHRs from same cycle
+- **HRRR refresh** - re-scans for newly published FHRs every 45s while other models download
 - **Single-cycle targeting** - only downloads latest available cycle per model (no handoff)
 - **Extended 48h** for HRRR synoptic cycles (00/06/12/18z)
+- **Configurable**: `--hrrr-slots 3 --gfs-slots 1 --rrfs-slots 1`
 
 ### Admin Key System
 - Set via `WXSECTION_KEY` environment variable (never stored in code)
@@ -153,9 +155,9 @@ tools/
 │   ├── Community favorites          # Save/load/delete with 12h expiry
 │   └── Admin key system             # WXSECTION_KEY env var
 │
-├── auto_update.py                   # HRRR-priority batched download daemon
-│   ├── Batched interleaving         # HRRR batch of 5, then GFS/RRFS round-robin
-│   ├── Fail-fast                    # Yields to other models on unavailable FHRs
+├── auto_update.py                   # Slot-based concurrent download daemon
+│   ├── Concurrent slots             # 3 HRRR + 1 GFS + 1 RRFS in parallel
+│   ├── HRRR fail-fast               # Prunes unavailable FHRs from queue
 │   ├── Extended 48h                 # Synoptic HRRR cycles get F19-F48
 │   └── Space-based cleanup          # Evicts least-popular when disk full
 │

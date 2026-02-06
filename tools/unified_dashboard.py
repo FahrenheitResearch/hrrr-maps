@@ -5037,11 +5037,27 @@ def api_request_cycle():
     model_name = mgr.model_name
     cycle_key = f"{date_str}/{hour:02d}z"
 
-    # Determine source
+    # Determine source label + source preference for archive requests
     from datetime import timezone
     date_dt = datetime.strptime(f"{date_str}{hour:02d}", '%Y%m%d%H').replace(tzinfo=timezone.utc)
     age_hours = (datetime.now(timezone.utc) - date_dt).total_seconds() / 3600
-    source = "AWS archive" if age_hours > 48 else "NOMADS"
+    source_preference = None
+    if model_name == 'hrrr':
+        if age_hours > 48:
+            source = "AWS archive"
+            source_preference = ['aws', 'pando', 'nomads']
+        else:
+            source = "NOMADS"
+    elif model_name == 'rrfs':
+        source = "AWS"
+        source_preference = ['aws']
+    elif model_name == 'gfs':
+        source = "NOMADS/NCEP"
+        if age_hours > 48:
+            source = "NCEP backup"
+            source_preference = ['ftpprd', 'nomads']
+    else:
+        source = "primary sources"
 
     # Download in background with progress tracking — load each FHR as it arrives
     def download_cycle():
@@ -5085,6 +5101,7 @@ def api_request_cycle():
                 on_complete=on_fhr_done,
                 on_start=on_fhr_start,
                 should_cancel=lambda: is_cancelled(op_id),
+                source_preference=source_preference,
             )
             if is_cancelled(op_id):
                 logger.info(f"Download CANCELLED for {model_name} {cycle_key}")

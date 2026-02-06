@@ -25,7 +25,8 @@ if pgrep -f "auto_update" > /dev/null; then
     echo "  Auto-update already running"
 else
     echo "Starting auto-update..."
-    nohup python tools/auto_update.py --interval 2 --models hrrr,gfs,rrfs > /tmp/auto_update.log 2>&1 &
+    nohup python tools/auto_update.py --interval 2 --models hrrr,gfs,rrfs \
+        --hrrr-slots 3 --gfs-slots 1 --rrfs-slots 1 > /tmp/auto_update.log 2>&1 &
     echo "  PID: $!"
 fi
 

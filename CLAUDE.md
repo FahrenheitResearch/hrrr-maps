@@ -9,7 +9,7 @@ Multi-model atmospheric cross-section generator. Users draw a line on a map, get
 ```
 tools/unified_dashboard.py    — Flask server + Leaflet UI + all API endpoints (~5000 lines)
 core/cross_section_interactive.py  — Rendering engine (matplotlib + cartopy, 0.5s warm)
-tools/auto_update.py          — GRIB download daemon (HRRR-priority batched)
+tools/auto_update.py          — GRIB download daemon (slot-based concurrent)
 model_config.py               — Model registry (HRRR/GFS/RRFS metadata, URLs, grids)
 smart_hrrr/orchestrator.py    — Parallel GRIB download with callbacks
 start.sh                      — Production startup (mount VHD, start services, cloudflared)
@@ -19,7 +19,7 @@ start.sh                      — Production startup (mount VHD, start services,
 
 - **Mmap cache on NVMe**: GRIB files are converted to raw numpy arrays (2.3GB/FHR on disk, ~100MB resident RAM). This is what makes instant cross-sections possible.
 - **Single-process, threaded**: WSL2 folio contention breaks ProcessPoolExecutor. Everything runs in one process with ThreadPoolExecutor.
-- **HRRR-priority auto-update**: HRRR downloads in batches of 5, then yields to GFS/RRFS. Fail-fast when FHRs aren't published yet.
+- **Slot-based concurrent auto-update**: 3 HRRR + 1 GFS + 1 RRFS download slots in parallel via ThreadPoolExecutor. Each model has its own lane — slow RRFS can't block HRRR. HRRR fail-fast prunes unavailable FHRs.
 - **No handoff cycles**: Only one synoptic (48h) HRRR cycle, only one GFS/RRFS cycle. Previous cycles are evicted.
 - **Two-tier NVMe eviction**: Rotated preload cycles always evicted. Archive request caches persist up to 670GB.
 
@@ -52,6 +52,9 @@ Logs: `/tmp/dashboard.log`, `/tmp/auto_update.log`, `/tmp/cloudflared.log`
 | Mmap load (cached on NVMe) | <0.1s |
 | Parallel prerender (19 frames) | ~4s |
 | Full preload (125 uncached FHRs) | ~48 min |
+| HRRR FHR download (1.17GB) | ~170s |
+| GFS FHR download (516MB) | ~83s |
+| RRFS FHR download (795MB) | ~124s |
 
 ## Critical Constraints
 
@@ -72,8 +75,10 @@ GRIB_WORKERS = 4           # GRIB conversion threads
 CACHE_LIMIT_GB = 670       # NVMe cache size limit
 HRRR_HOURLY_CYCLES = 3     # Non-synoptic cycles in preload window
 
-# auto_update.py
-HRRR_BATCH_SIZE = 5        # HRRR FHRs per batch before yielding to GFS/RRFS
+# auto_update.py (slot-based concurrent)
+HRRR_SLOTS = 3             # --hrrr-slots: concurrent HRRR downloads
+GFS_SLOTS = 1              # --gfs-slots: concurrent GFS downloads
+RRFS_SLOTS = 1             # --rrfs-slots: concurrent RRFS downloads
 DISK_LIMIT_GB = 500        # GRIB source disk limit on VHD
 ```
 
@@ -104,7 +109,8 @@ XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=cwtc nohup python3 tools/unified_dashboa
 ### Restart auto-update
 ```bash
 pkill -f auto_update; sleep 2
-nohup python tools/auto_update.py --interval 2 --models hrrr,gfs,rrfs > /tmp/auto_update.log 2>&1 &
+nohup python tools/auto_update.py --interval 2 --models hrrr,gfs,rrfs \
+  --hrrr-slots 3 --gfs-slots 1 --rrfs-slots 1 > /tmp/auto_update.log 2>&1 &
 ```
 
 ### Check what's loaded
@@ -119,9 +125,30 @@ df -h /
 du -sh ~/hrrr-maps/cache/xsect/*/
 ```
 
+## Download Architecture
+
+Auto-update uses slot-based concurrency (`run_download_pass_concurrent`):
+- Each model gets dedicated ThreadPoolExecutor slots (3 HRRR + 1 GFS + 1 RRFS)
+- Models download in parallel — slow RRFS can't block HRRR
+- HRRR fail-fast: if an FHR isn't published, prunes higher FHRs from same cycle
+- HRRR queue refreshes every 45s for newly published FHRs
+- `download_forecast_hour` requires ALL file types to succeed (wrfprs + wrfsfc + wrfnat for HRRR)
+
+**NOMADS is the bottleneck**: ~6-7 MB/s per connection regardless of local bandwidth.
+5 concurrent connections = ~265 Mbps sustained. Safe up to ~7-8 before throttling risk.
+
+### Archive Downloads (dashboard `request_cycle`)
+- Triggered via `/api/request_cycle` (admin-gated)
+- Downloads from AWS archive (NOAA Big Data Program), not NOMADS
+- Uses `download_gribs_parallel` with `max_threads=8`
+- Progress shown in real-time via `/api/progress`
+- Cancellable via `/api/cancel`
+- Downloaded cycles tracked in `ARCHIVE_CACHE_KEYS` set for NVMe cache persistence
+
 ## Known Performance Bottlenecks
 
-1. **GRIB conversion (23s/FHR)**: cfgrib + xarray overhead. Could improve by using eccodes directly or a Rust/C GRIB reader.
-2. **Matplotlib render (0.5s)**: CPU-bound. Agg backend releases GIL for some C work but font/text rendering is Python.
-3. **WSL2 VHD I/O**: All disk goes through Hyper-V virtual block layer. Native Linux would be faster.
-4. **GFS data volume**: 65 FHRs x 6h intervals = F00-F384. Full cycle download is large.
+1. **NOMADS per-connection speed (~6-7 MB/s)**: Main download bottleneck. More slots help linearly up to ~8 connections.
+2. **GRIB conversion (23s/FHR)**: cfgrib + xarray overhead. Could improve by using eccodes directly or a Rust/C GRIB reader.
+3. **Matplotlib render (0.5s)**: CPU-bound. Agg backend releases GIL for some C work but font/text rendering is Python.
+4. **WSL2 VHD I/O**: All disk goes through Hyper-V virtual block layer. Native Linux would be faster.
+5. **GFS data volume**: 65 FHRs x 6h intervals = F00-F384. Full cycle download is large.
