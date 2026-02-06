@@ -18,37 +18,54 @@ Or manually:
 sudo mount /dev/sde /mnt/hrrr
 nohup python tools/auto_update.py --interval 2 --models hrrr,gfs,rrfs \
     --hrrr-slots 3 --gfs-slots 1 --rrfs-slots 1 > /tmp/auto_update.log 2>&1 &
-XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=cwtc nohup python3 tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs > /tmp/dashboard.log 2>&1 &
+XSECT_GRIB_BACKEND=auto WXSECTION_KEY=cwtc nohup python3 tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs > /tmp/dashboard.log 2>&1 &
 nohup cloudflared tunnel run wxsection > /tmp/cloudflared.log 2>&1 &
 ```
 
 ---
 
-## CRITICAL ISSUE: GRIB-to-mmap Conversion Bottleneck
+## GRIB-to-mmap Conversion Performance
 
-### The Problem (~23s/FHR on NVMe, was ~50s on VHD)
-- **cfgrib** does extensive Python-level work between eccodes C calls — dominated by GIL contention
-- 20 threads = 0 completions in 3+ min (99/102 threads on `futex_wait_queue`)
-- **4 ThreadPool workers is the only stable config** — the current bottleneck
-- Full preload of ~125 uncached FHRs takes ~48 min at current rate
-- This is the #1 performance bottleneck affecting user experience
+### Current State (~15s/FHR with eccodes, was ~23s with cfgrib)
+- **Default backend switched to `auto`** (tries eccodes direct, falls back to cfgrib)
+- eccodes one-pass scan is ~35% faster than cfgrib+xarray for HRRR
+- **4 ThreadPool workers** remains the sweet spot (3-4 optimal, >4 regresses due to GIL)
+- **Smoke loading is lazy** — wrfnat (652MB, 50 hybrid levels) only loaded on first smoke style request, not during preload
+- Worker counts configurable at runtime: `--grib-workers N` / `--preload-workers N` (or env `XSECT_GRIB_WORKERS` / `XSECT_PRELOAD_WORKERS`)
+
+### Measured Performance (this machine)
+```
+Single FHR GRIB-to-mmap (uncached):
+  HRRR: ~15s (eccodes/auto) vs ~23s (cfgrib) vs ~33s (cfgrib, measured)
+  GFS:  ~11s (eccodes) vs ~17s (cfgrib)
+  RRFS: ~28s (eccodes) vs ~41s (cfgrib)
+
+Scaling (HRRR, eccodes, 6 FHR batch wall time):
+  1 worker: 184s, 2: 73s, 3: 67s, 4: 68s, 5: 79s, 6: 74s
+  Knee at 3-4 workers; going higher regresses.
+
+Cached preload (176 FHRs across HRRR+GFS+RRFS): ~4s total
+  (was ~100s+ before lazy smoke — 26 wrfnat backfills blocked preload)
+```
 
 ### What the conversion does (`load_forecast_hour` in cross_section_interactive.py)
 ```
 1. Check mmap cache dir → if exists, load in <0.1s (done)
 2. Check legacy .npz cache → if exists, migrate to mmap (rare)
-3. Load from GRIB (the slow path, ~23s):
-   a. cfgrib.open_dataset() for 10 pressure-level fields (t, u, v, r, w, q, gh, absv, clwmr, dpt)
-   b. cfgrib.open_dataset() for surface pressure
-   c. Load smoke PM2.5 from wrfnat file (50 hybrid levels)
-   d. Compute derived fields (theta, temp_c)
-   e. Save all fields to mmap cache (14 fields x 40 levels x 1059x1799)
+3. Load from GRIB (the slow path, ~15s with eccodes):
+   a. One-pass eccodes scan for 10 pressure-level fields (t, u, v, r, w, q, gh, absv, clwmr, dpt)
+   b. Second scan for surface pressure
+   c. Compute derived fields (theta via vectorized numpy, temp_c)
+   d. Save all fields to mmap cache (14 fields x 40 levels x 1059x1799)
+   e. Smoke PM2.5 NOT loaded here — deferred to first smoke render request
 ```
 
-### Why more threads don't help
-- cfgrib does Python-level iteration between eccodes C calls
-- GIL prevents true parallel execution for Python-bound work
-- At >4 threads, workers spend most time in `futex_wait_queue`
+### Lazy Smoke Loading
+- wrfnat files are 652MB each with 50 hybrid levels — expensive to decode
+- Previously loaded during every mmap cache load, causing 99-104s stalls when 20 threads hit VHD concurrently
+- Now loaded on-demand: first `style=smoke` request triggers `_backfill_smoke()`, which loads wrfnat, saves smoke_hyb.npy to mmap cache
+- Subsequent loads pick up smoke from mmap cache automatically (included in `_FLOAT16_FIELDS`)
+- `ForecastHourData.grib_file` field stores source path for lazy resolution
 
 ### WSL2 VHD Folio Contention (blocks ProcessPoolExecutor)
 - Both `/dev/sdd` (NVMe VHD) and `/dev/sde` (external VHD) go through Hyper-V virtual block layer
@@ -56,13 +73,11 @@ nohup cloudflared tunnel run wxsection > /tmp/cloudflared.log 2>&1 &
 - ThreadPoolExecutor (single process) avoids folio; ProcessPoolExecutor triggers it
 - This is NOT disk speed — it's WSL2-specific kernel contention
 
-### Possible approaches to investigate
-1. **eccodes Python bindings directly** — skip cfgrib/xarray overhead, extract only needed fields
-2. **cfgrib with `indexpath=''`** — skip GRIB index file generation
-3. **Rust/C GRIB reader** (e.g., wgrib2 subprocess) — extract fields to numpy, bypass Python GIL entirely
-4. **Per-field parallelism** — split the 10+ cfgrib.open_dataset() calls across threads/processes
-5. **subprocess-based parallelism** — spawn separate Python processes for each FHR, avoid GIL. May hit WSL2 folio issues.
-6. **Pre-extract to intermediate format** — auto_update converts GRIB→mmap immediately after download, before dashboard needs it
+### Remaining optimization paths
+1. **Pre-extract in auto_update** — convert GRIB→mmap immediately after download, before dashboard needs it
+2. **Rust/C GRIB reader** (e.g., wgrib2 subprocess) — bypass Python GIL entirely
+3. **Per-field parallelism** — split the eccodes scan across threads (risky with GIL)
+4. **Lazy field loading** — only decode fields needed for the requested style (skip cloud for temp, etc.)
 
 ---
 
@@ -83,8 +98,8 @@ Only these cycles appear in the run picker dropdown. Archive-requested cycles ap
 
 ### Two-Phase Preload (cache-first)
 ```
-Phase 1: ThreadPoolExecutor(20 workers) — cached mmap loads (<0.1s each)
-Phase 2: ThreadPoolExecutor(4 workers)  — GRIB conversion (~23s each on NVMe)
+Phase 1: ThreadPoolExecutor(20 workers) — cached mmap loads (<0.1s each, no smoke)
+Phase 2: ThreadPoolExecutor(4 workers)  — GRIB conversion (~15s each with eccodes)
 ```
 Partitions FHRs by checking if mmap cache dir exists. Users see data immediately from Phase 1 instead of waiting for all GRIB conversions.
 

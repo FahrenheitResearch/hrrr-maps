@@ -63,6 +63,9 @@ class ForecastHourData:
     theta: np.ndarray = None  # K
     temp_c: np.ndarray = None  # C
 
+    # Source GRIB path (for lazy smoke backfill)
+    grib_file: str = None
+
     def memory_usage_mb(self) -> float:
         """Estimate memory usage in MB.
 
@@ -318,7 +321,7 @@ def _load_hour_process(
 
     try:
         print(f"Loading F{forecast_hour:02d} from {Path(grib_file).name}...")
-        start = time.time()
+        start = time.perf_counter()
 
         fhr_data = None
         backend_used = None
@@ -387,13 +390,11 @@ def _load_hour_process(
 
         # Pre-compute theta
         if fhr_data.temperature is not None:
-            theta = np.zeros_like(fhr_data.temperature)
-            for lev_idx, p in enumerate(fhr_data.pressure_levels):
-                theta[lev_idx] = fhr_data.temperature[lev_idx] * (1000.0 / p) ** 0.286
-            fhr_data.theta = theta
+            scale = (1000.0 / np.asarray(fhr_data.pressure_levels, dtype=np.float32)) ** 0.286
+            fhr_data.theta = fhr_data.temperature * scale[:, None, None]
             fhr_data.temp_c = fhr_data.temperature - 273.15
 
-        duration = time.time() - start
+        duration = time.perf_counter() - start
         print(f"  Loaded F{forecast_hour:02d} in {duration:.1f}s ({fhr_data.memory_usage_mb():.0f} MB) using {backend_used}")
         return fhr_data
 
@@ -1108,7 +1109,7 @@ class InteractiveCrossSection:
         if mmap_dir and mmap_dir.is_dir():
             cb(1, 2, "Loading from mmap cache...")
             print(f"Loading F{forecast_hour:02d} from mmap cache...")
-            start = time.time()
+            start = time.perf_counter()
             fhr_data = self._load_from_mmap_cache(mmap_dir)
             if fhr_data is not None:
                 err = self._validate_fhr_data(fhr_data)
@@ -1116,9 +1117,9 @@ class InteractiveCrossSection:
                     self._discard_cache(mmap_dir, err)
                     fhr_data = None
             if fhr_data is not None:
-                self._backfill_smoke(fhr_data, grib_file, mmap_cache_dir=mmap_dir)
+                fhr_data.grib_file = grib_file
                 self.forecast_hours[forecast_hour] = fhr_data
-                duration = time.time() - start
+                duration = time.perf_counter() - start
                 print(f"  Loaded F{forecast_hour:02d} from mmap cache in {duration:.3f}s ({fhr_data.memory_usage_mb():.0f} MB heap)")
                 cb(2, 2, "Done")
                 return True
@@ -1128,7 +1129,7 @@ class InteractiveCrossSection:
         if legacy_path and legacy_path.exists():
             cb(1, 2, "Loading from cache...")
             print(f"Loading F{forecast_hour:02d} from legacy cache...")
-            start = time.time()
+            start = time.perf_counter()
             fhr_data = self._load_from_legacy_cache(legacy_path)
             if fhr_data is not None:
                 err = self._validate_fhr_data(fhr_data)
@@ -1150,10 +1151,9 @@ class InteractiveCrossSection:
                             print(f"  Migrated to mmap, removed legacy .npz")
                     except Exception as e:
                         print(f"  Warning: Could not migrate to mmap: {e}")
-                self._backfill_smoke(fhr_data, grib_file,
-                                     mmap_cache_dir=mmap_dir if mmap_dir and mmap_dir.is_dir() else None)
+                fhr_data.grib_file = grib_file
                 self.forecast_hours[forecast_hour] = fhr_data
-                duration = time.time() - start
+                duration = time.perf_counter() - start
                 print(f"  Loaded F{forecast_hour:02d} from cache in {duration:.1f}s ({fhr_data.memory_usage_mb():.0f} MB)")
                 cb(2, 2, "Done")
                 return True
@@ -1168,7 +1168,7 @@ class InteractiveCrossSection:
 
         try:
             print(f"Loading F{forecast_hour:02d} from {Path(grib_file).name}...")
-            start = time.time()
+            start = time.perf_counter()
             fhr_data = None
             backend_used = None
             backend_errors = []
@@ -1219,12 +1219,8 @@ class InteractiveCrossSection:
             # Pre-compute theta and temp_c
             cb(13, total_steps, "Computing derived fields...")
             if fhr_data.temperature is not None:
-                P_ref = 1000.0
-                kappa = 0.286
-                theta = np.zeros_like(fhr_data.temperature)
-                for lev_idx, p in enumerate(fhr_data.pressure_levels):
-                    theta[lev_idx] = fhr_data.temperature[lev_idx] * (P_ref / p) ** kappa
-                fhr_data.theta = theta
+                scale = (1000.0 / np.asarray(fhr_data.pressure_levels, dtype=np.float32)) ** 0.286
+                fhr_data.theta = fhr_data.temperature * scale[:, None, None]
                 fhr_data.temp_c = fhr_data.temperature - 273.15
 
             # Validate before storing — don't cache incomplete data
@@ -1234,9 +1230,10 @@ class InteractiveCrossSection:
                 return False
 
             # Store
+            fhr_data.grib_file = grib_file
             self.forecast_hours[forecast_hour] = fhr_data
 
-            duration = time.time() - start
+            duration = time.perf_counter() - start
             mem_mb = fhr_data.memory_usage_mb()
             print(f"  Loaded F{forecast_hour:02d} in {duration:.1f}s ({mem_mb:.0f} MB) using {backend_used}")
 
@@ -1246,6 +1243,7 @@ class InteractiveCrossSection:
                     self._save_to_mmap_cache(fhr_data, mmap_dir)
                     fhr_mmap = self._load_from_mmap_cache(mmap_dir)
                     if fhr_mmap is not None:
+                        fhr_mmap.grib_file = grib_file
                         self.forecast_hours[forecast_hour] = fhr_mmap
                         print(f"  Cached to {mmap_dir.name}/ (mmap, {fhr_mmap.memory_usage_mb():.0f} MB heap)")
                     else:
@@ -1309,7 +1307,7 @@ class InteractiveCrossSection:
             return 0
 
         print(f"Loading {len(files_to_load)} forecast hours with {workers} workers...")
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         if workers <= 1:
             # Sequential loading
@@ -1341,7 +1339,7 @@ class InteractiveCrossSection:
                     except Exception as e:
                         print(f"Error loading F{fhr:02d}: {e}")
 
-        duration = time.time() - start_time
+        duration = time.perf_counter() - start_time
         loaded = len(self.forecast_hours)
         total_mem = sum(fh.memory_usage_mb() for fh in self.forecast_hours.values())
         print(f"\nLoaded {loaded} forecast hours ({total_mem:.0f} MB total) in {duration:.1f}s")
@@ -1354,7 +1352,7 @@ class InteractiveCrossSection:
             import cfgrib
 
             print(f"Loading F{forecast_hour:02d} from {Path(grib_file).name}...")
-            start = time.time()
+            start = time.perf_counter()
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -1438,15 +1436,11 @@ class InteractiveCrossSection:
 
                 # Pre-compute theta and temp_c
                 if fhr_data.temperature is not None:
-                    P_ref = 1000.0
-                    kappa = 0.286
-                    theta = np.zeros_like(fhr_data.temperature)
-                    for lev_idx, p in enumerate(pressure_levels):
-                        theta[lev_idx] = fhr_data.temperature[lev_idx] * (P_ref / p) ** kappa
-                    fhr_data.theta = theta
+                    scale = (1000.0 / np.asarray(pressure_levels, dtype=np.float32)) ** 0.286
+                    fhr_data.theta = fhr_data.temperature * scale[:, None, None]
                     fhr_data.temp_c = fhr_data.temperature - 273.15
 
-                duration = time.time() - start
+                duration = time.perf_counter() - start
                 mem_mb = fhr_data.memory_usage_mb()
                 print(f"  Loaded F{forecast_hour:02d} in {duration:.1f}s ({mem_mb:.0f} MB)")
 
@@ -1707,7 +1701,7 @@ class InteractiveCrossSection:
             print(f"Forecast hour {forecast_hour} not loaded")
             return None
 
-        start = time.time()
+        start = time.perf_counter()
 
         # Get pre-loaded data
         fhr_data = self.forecast_hours[forecast_hour]
@@ -1719,7 +1713,7 @@ class InteractiveCrossSection:
         # Interpolate all needed fields to path
         data = self._interpolate_to_path(fhr_data, path_lats, path_lons, style)
 
-        t_interp = time.time() - start
+        t_interp = time.perf_counter() - start
 
         if not return_image:
             return data
@@ -1768,7 +1762,7 @@ class InteractiveCrossSection:
         # Render
         img_bytes = self._render_cross_section(data, style, dpi, metadata, y_axis, vscale, y_top, units=units, temp_cmap=temp_cmap, ref_pressure_levels=ref_pressure_levels, anomaly=anomaly, climo_info=climo_info)
 
-        t_total = time.time() - start
+        t_total = time.perf_counter() - start
         print(f"Cross-section generated in {t_total:.3f}s (interp: {t_interp:.3f}s)")
 
         return img_bytes
@@ -1928,11 +1922,17 @@ class InteractiveCrossSection:
         if style in ['rh', 'q'] and fhr_data.rh is not None:
             result['rh'] = interp_3d(fhr_data.rh)
 
-        if style == 'smoke' and fhr_data.smoke_hyb is not None:
-            # Interpolate smoke and its pressure coordinate along path on native hybrid levels
-            # interp_3d works on any (n_levels, ny, nx) array — hybrid levels work the same way
-            result['smoke_hyb'] = interp_3d(fhr_data.smoke_hyb)  # (n_hyb, n_points)
-            result['smoke_pres_hyb'] = interp_3d(fhr_data.smoke_pres_hyb)  # (n_hyb, n_points)
+        if style == 'smoke':
+            # Lazy smoke backfill: load from wrfnat on first smoke request
+            if fhr_data.smoke_hyb is None and fhr_data.grib_file:
+                mmap_dir = self._get_mmap_cache_dir(fhr_data.grib_file)
+                self._backfill_smoke(fhr_data, fhr_data.grib_file,
+                                     mmap_cache_dir=mmap_dir if mmap_dir and mmap_dir.is_dir() else None)
+            if fhr_data.smoke_hyb is not None:
+                # Interpolate smoke and its pressure coordinate along path on native hybrid levels
+                # interp_3d works on any (n_levels, ny, nx) array — hybrid levels work the same way
+                result['smoke_hyb'] = interp_3d(fhr_data.smoke_hyb)  # (n_hyb, n_points)
+                result['smoke_pres_hyb'] = interp_3d(fhr_data.smoke_pres_hyb)  # (n_hyb, n_points)
 
         if style == 'omega' and fhr_data.omega is not None:
             result['omega'] = interp_3d(fhr_data.omega)

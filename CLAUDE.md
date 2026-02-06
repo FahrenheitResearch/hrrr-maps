@@ -18,6 +18,8 @@ start.sh                      — Production startup (mount VHD, start services,
 ## Key Design Decisions
 
 - **Mmap cache on NVMe**: GRIB files are converted to raw numpy arrays (2.3GB/FHR on disk, ~100MB resident RAM). This is what makes instant cross-sections possible.
+- **eccodes `auto` backend**: Default GRIB backend tries eccodes direct (one-pass scan, ~35% faster), falls back to cfgrib. Configurable via `XSECT_GRIB_BACKEND` env var.
+- **Lazy smoke loading**: wrfnat files (652MB, 50 hybrid levels) loaded on-demand on first `smoke` style request, not during preload. `ForecastHourData.grib_file` stores source path for deferred resolution.
 - **Single-process, threaded**: WSL2 folio contention breaks ProcessPoolExecutor. Everything runs in one process with ThreadPoolExecutor.
 - **Slot-based concurrent auto-update**: 3 HRRR + 1 GFS + 1 RRFS download slots in parallel via ThreadPoolExecutor. Each model has its own lane — slow RRFS can't block HRRR. HRRR fail-fast prunes unavailable FHRs.
 - **Status file IPC**: auto_update.py writes `/tmp/auto_update_status.json` atomically; dashboard reads it to show download progress in the activity panel. No shared memory or sockets.
@@ -31,7 +33,7 @@ cd ~/hrrr-maps && ./start.sh
 # Or:
 sudo mount /dev/sde /mnt/hrrr
 python tools/auto_update.py --interval 2 --models hrrr,gfs,rrfs &
-XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=cwtc python3 tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs
+XSECT_GRIB_BACKEND=auto WXSECTION_KEY=cwtc python3 tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs
 ```
 
 Logs: `/tmp/dashboard.log`, `/tmp/auto_update.log`, `/tmp/cloudflared.log`
@@ -49,21 +51,22 @@ Logs: `/tmp/dashboard.log`, `/tmp/auto_update.log`, `/tmp/cloudflared.log`
 |-----------|------|
 | Warm render (cached FHR) | ~0.5s |
 | Cached prerender (from frame cache) | ~20ms |
-| GRIB-to-mmap conversion | ~23s/FHR |
+| GRIB-to-mmap conversion (eccodes) | ~15s/FHR HRRR, ~11s GFS, ~28s RRFS |
 | Mmap load (cached on NVMe) | <0.1s |
+| Cached preload (176 FHRs) | ~4s total |
 | Parallel prerender (19 frames) | ~4s |
-| Full preload (125 uncached FHRs) | ~48 min |
 | HRRR FHR download (1.17GB) | ~170s |
 | GFS FHR download (516MB) | ~83s |
 | RRFS FHR download (795MB) | ~124s |
 
 ## Critical Constraints
 
-1. **cfgrib is GIL-bound**: Can't parallelize GRIB conversion beyond 4 threads. Don't try ProcessPoolExecutor — folio contention on WSL2.
+1. **GRIB conversion is GIL-bound**: eccodes/cfgrib can't parallelize beyond 3-4 threads. Don't try ProcessPoolExecutor — folio contention on WSL2.
 2. **matplotlib is not thread-safe**: The Agg backend works with ThreadPool but font cache can throw warnings under load. Non-fatal.
 3. **Memory budget**: HRRR 48GB, GFS 8GB, RRFS 8GB. Mmap keeps resident small but monitor with `/api/status`.
 4. **NVMe space**: 670GB cache limit enforced by `cache_evict_old_cycles()`. Monitor with `df -h /`.
 5. **VHD must be mounted**: `/mnt/hrrr` needs `sudo mount /dev/sde /mnt/hrrr` after every WSL restart.
+6. **Smoke loading is lazy**: wrfnat (652MB, 50 hybrid levels) only loaded on first `style=smoke` request, not during preload. Saves ~100s on startup.
 
 ## Key Constants
 
@@ -71,10 +74,11 @@ Logs: `/tmp/dashboard.log`, `/tmp/auto_update.log`, `/tmp/cloudflared.log`
 # unified_dashboard.py
 RENDER_SEMAPHORE = 12      # Max concurrent matplotlib renders
 PRERENDER_WORKERS = 8      # Parallel prerender threads
-PRELOAD_WORKERS = 20       # Cached mmap load threads
-GRIB_WORKERS = 4           # GRIB conversion threads (THE BOTTLENECK)
+PRELOAD_WORKERS = 20       # Cached mmap load threads (--preload-workers / XSECT_PRELOAD_WORKERS)
+GRIB_WORKERS = 4           # GRIB conversion threads (--grib-workers / XSECT_GRIB_WORKERS)
 CACHE_LIMIT_GB = 670       # NVMe cache size limit
 HRRR_HOURLY_CYCLES = 3     # Non-synoptic cycles in preload window
+GRIB_BACKEND = 'auto'      # XSECT_GRIB_BACKEND: auto (eccodes→cfgrib fallback), eccodes, cfgrib
 
 # auto_update.py (slot-based concurrent)
 HRRR_SLOTS = 3             # --hrrr-slots: concurrent HRRR downloads
@@ -105,7 +109,7 @@ See [API_GUIDE.md](API_GUIDE.md) for full documentation.
 ### Restart dashboard
 ```bash
 pkill -f unified_dashboard; sleep 2
-XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=cwtc nohup python3 tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs > /tmp/dashboard.log 2>&1 &
+XSECT_GRIB_BACKEND=auto WXSECTION_KEY=cwtc nohup python3 tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs > /tmp/dashboard.log 2>&1 &
 ```
 
 ### Restart auto-update
@@ -170,7 +174,7 @@ Memory button shows all models (HRRR + GFS + RRFS) grouped by model. Each model 
 
 ## Known Performance Bottlenecks
 
-1. **GRIB-to-mmap conversion (23s/FHR)**: THE #1 BOTTLENECK. cfgrib is GIL-bound, only 4 threads stable. Full preload of ~125 uncached FHRs takes ~48 min. See CONTEXT.md for detailed analysis and investigation approaches.
+1. **GRIB-to-mmap conversion (~15s/FHR)**: Still the #1 bottleneck. eccodes `auto` backend is ~35% faster than cfgrib but still GIL-bound. 3-4 workers optimal (knee at 3, regresses >4). See CONTEXT.md for detailed analysis.
 2. **NOMADS per-connection speed (~6-7 MB/s)**: Main download bottleneck. More slots help linearly up to ~8 connections.
 3. **Matplotlib render (0.5s)**: CPU-bound. Agg backend releases GIL for some C work but font/text rendering is Python.
 4. **WSL2 VHD I/O**: All disk goes through Hyper-V virtual block layer. Native Linux would be faster.

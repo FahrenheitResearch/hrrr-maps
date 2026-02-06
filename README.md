@@ -27,7 +27,7 @@ cd ~/hrrr-maps && ./start.sh
 # Or run manually:
 sudo mount /dev/sde /mnt/hrrr
 python tools/auto_update.py --interval 2 --models hrrr,gfs,rrfs &
-XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=your_key python tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs
+XSECT_GRIB_BACKEND=auto WXSECTION_KEY=your_key python tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs
 ```
 
 ## Features
@@ -62,12 +62,15 @@ XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=your_key python tools/unified_dashboard.
 
 ### Performance
 - **0.5s warm renders** - cartopy geometry cache + KDTree cache eliminate repeated I/O
-- **~23s GRIB-to-mmap conversion** on NVMe (was ~50s on VHD)
+- **~15s GRIB-to-mmap conversion** with eccodes backend (~35% faster than cfgrib)
 - **<0.1s cached FHR loads** - mmap from NVMe, instant page faults
+- **~4s cached preload** for 176 FHRs across all models (HRRR+GFS+RRFS)
+- **Lazy smoke loading** - wrfnat (652MB, 50 hybrid levels) loaded on first smoke request, not during preload
 - **Frame prerender cache** - 500-entry server-side cache, ~20ms cached vs ~0.5s live render
 - **Parallel prerender** - ThreadPool(8) batch rendering, ~4s for 19 frames (was ~10s sequential)
 - **Two-phase preload**: cached FHRs load instantly (Phase 1), GRIB conversions run in background (Phase 2)
 - **Render semaphore** - caps concurrent matplotlib renders at 12 (8 prerender + 4 live)
+- **Configurable workers** - `--grib-workers N` / `--preload-workers N` (or env `XSECT_GRIB_WORKERS` / `XSECT_PRELOAD_WORKERS`)
 
 ### Mmap Cache Architecture
 - **Memory-mapped cache on NVMe** - per-field raw arrays, ~2.3GB per FHR on disk
@@ -246,7 +249,11 @@ WXSECTION_KEY=secret python tools/unified_dashboard.py [OPTIONS]
 --port PORT          Server port (default: 5561)
 --host HOST          Server host (default: 0.0.0.0)
 --models M           Comma-separated models (default: hrrr)
+--grib-workers N     GRIB conversion threads (default: 4, env XSECT_GRIB_WORKERS)
+--preload-workers N  Cached mmap load threads (default: 20, env XSECT_PRELOAD_WORKERS)
 ```
+
+Environment: `XSECT_GRIB_BACKEND=auto` (default) tries eccodes, falls back to cfgrib.
 
 ### Auto-Update Daemon
 ```
@@ -280,4 +287,5 @@ Contributors: @jasonbweather, justincat66, Sequoiagrove, California Wildfire Tra
 - [HRRR Model](https://rapidrefresh.noaa.gov/hrrr/) - NOAA's 3km CONUS model
 - [GFS Model](https://www.ncei.noaa.gov/products/weather-climate-models/global-forecast) - NOAA's 0.25deg global model
 - [RRFS Model](https://gsl.noaa.gov/focus-areas/unified_forecast_system) - NOAA's next-gen 3km CONUS model
-- [cfgrib](https://github.com/ecmwf/cfgrib) - GRIB file reader
+- [eccodes](https://github.com/ecmwf/eccodes) - ECMWF GRIB library (default backend via `auto`)
+- [cfgrib](https://github.com/ecmwf/cfgrib) - GRIB file reader (fallback backend)

@@ -588,6 +588,16 @@ MODEL_EXCLUDED_STYLES = {
     'hrrr': set(),          # HRRR supports all styles
 }
 
+def _env_int(name: str, default: int) -> int:
+    """Parse integer env var with fallback."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
 
 class CrossSectionManager:
     """Manages cross-section data with smart pre-loading.
@@ -771,7 +781,7 @@ class CrossSectionManager:
         if self.xsect is None:
             from core.cross_section_interactive import InteractiveCrossSection
             cache_dir = f'{self.CACHE_BASE}/{self.model_name}'
-            grib_backend = os.environ.get('XSECT_GRIB_BACKEND', 'cfgrib').strip().lower()
+            grib_backend = os.environ.get('XSECT_GRIB_BACKEND', 'auto').strip().lower()
             try:
                 self.xsect = InteractiveCrossSection(
                     cache_dir=cache_dir,
@@ -781,13 +791,13 @@ class CrossSectionManager:
                     grib_backend=grib_backend,
                 )
             except ValueError:
-                logger.warning(f"Invalid XSECT_GRIB_BACKEND='{grib_backend}', falling back to 'cfgrib'")
+                logger.warning(f"Invalid XSECT_GRIB_BACKEND='{grib_backend}', falling back to 'auto'")
                 self.xsect = InteractiveCrossSection(
                     cache_dir=cache_dir,
                     min_levels=self._min_levels,
                     sfc_resolver=lambda prs: self._sfc_file_from_prs(prs),
                     nat_resolver=lambda prs: self._nat_file_from_prs(prs),
-                    grib_backend='cfgrib',
+                    grib_backend='auto',
                 )
             self.xsect.model = self.model_name.upper()
             logger.info(f"Cross-section GRIB backend: {self.xsect.grib_backend}")
@@ -5320,6 +5330,10 @@ def main():
     parser.add_argument('--production', action='store_true', help='Enable rate limiting')
     parser.add_argument('--models', type=str, default='hrrr',
                         help='Comma-separated list of models to enable (e.g. hrrr,gfs)')
+    parser.add_argument('--grib-workers', type=int, default=_env_int('XSECT_GRIB_WORKERS', 4),
+                        help='Workers for uncached GRIB->mmap conversion (default: env XSECT_GRIB_WORKERS or 4)')
+    parser.add_argument('--preload-workers', type=int, default=_env_int('XSECT_PRELOAD_WORKERS', 20),
+                        help='Workers for cached mmap loads (default: env XSECT_PRELOAD_WORKERS or 20)')
 
     args = parser.parse_args()
     app.config['PRODUCTION'] = args.production
@@ -5329,6 +5343,14 @@ def main():
     for model_name in enabled_models:
         if model_name not in model_registry.managers:
             model_registry.register(model_name)
+
+    # Apply runtime worker tuning to all managers
+    grib_workers = max(1, args.grib_workers)
+    preload_workers = max(1, args.preload_workers)
+    for _, mgr in model_registry.managers.items():
+        mgr.GRIB_WORKERS = grib_workers
+        mgr.PRELOAD_WORKERS = preload_workers
+
     data_manager = model_registry.get('hrrr')  # Keep backward compat alias
 
     # Optionally download fresh data (HRRR only for now)
@@ -5418,6 +5440,8 @@ def main():
     logger.info("=" * 60)
     logger.info("Cross-Section Dashboard")
     logger.info(f"Models: {', '.join(m.upper() for m in enabled_models)}")
+    logger.info(f"GRIB backend default: {os.environ.get('XSECT_GRIB_BACKEND', 'auto')}")
+    logger.info(f"Workers: grib={grib_workers}, preload={preload_workers}")
     for model_name, mgr in model_registry.managers.items():
         mem_mb = mgr.xsect.get_memory_usage() if mgr.xsect else 0
         logger.info(f"  {model_name.upper()}: {len(mgr.loaded_cycles)} cycles loaded ({mem_mb:.0f} MB)")
