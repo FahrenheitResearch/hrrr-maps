@@ -62,7 +62,7 @@ Logs: `/tmp/dashboard.log`, `/tmp/auto_update.log`, `/tmp/cloudflared.log`
 ## Critical Constraints
 
 1. **GRIB conversion is GIL-bound**: eccodes/cfgrib can't parallelize beyond 3-4 threads. Don't try ProcessPoolExecutor — folio contention on WSL2.
-2. **matplotlib is not thread-safe**: The Agg backend works with ThreadPool but font cache can throw warnings under load. Non-fatal.
+2. **matplotlib OO API required**: Uses `Figure()` + `fig.add_subplot()` (not `plt.subplots()`) to avoid pyplot global state races under ThreadPoolExecutor. All colorbar/savefig calls go through `fig.` not `plt.`.
 3. **Memory budget**: HRRR 48GB, GFS 8GB, RRFS 8GB. Mmap keeps resident small but monitor with `/api/status`.
 4. **NVMe space**: 670GB cache limit enforced by `cache_evict_old_cycles()`. Monitor with `df -h /`.
 5. **VHD must be mounted**: `/mnt/hrrr` needs `sudo mount /dev/sde /mnt/hrrr` after every WSL restart.

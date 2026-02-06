@@ -819,9 +819,10 @@ class CrossSectionManager:
         """Scan for all available cycles on disk WITHOUT loading data."""
         from datetime import datetime
 
-        self.available_cycles = []
+        cycles = []
 
         if not self.base_dir.exists():
+            self.available_cycles = cycles
             return self.available_cycles
 
         # Scan for date directories
@@ -864,7 +865,7 @@ class CrossSectionManager:
                     cycle_key = f"{date_dir.name}_{hour}z"
                     init_dt = datetime.strptime(f"{date_dir.name}{hour}", "%Y%m%d%H")
 
-                    self.available_cycles.append({
+                    cycles.append({
                         'cycle_key': cycle_key,
                         'date': date_dir.name,
                         'hour': hour,
@@ -877,6 +878,7 @@ class CrossSectionManager:
                         'expected_fhrs': expected_fhrs,
                     })
 
+        self.available_cycles = cycles  # Atomic swap — no empty window
         return self.available_cycles
 
     def get_cycles_for_ui(self):
@@ -2662,6 +2664,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let isPlaying = false;
         let playInterval = null;
         let prerenderedFrames = {};  // fhr -> blobUrl
+        let xsectAbortController = null;  // Cancel stale xsect requests
 
         // Comparison mode state
         let compareActive = false;
@@ -2692,6 +2695,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 }
                 select.onchange = async () => {
                     currentModel = select.value;
+                    stopPlayback();
+                    invalidatePrerender();
                     updateStyleDropdownForModel();
                     await loadCycles();
                     generateCrossSection();
@@ -3332,6 +3337,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         });
 
         cycleSelect.onchange = async () => {
+            stopPlayback();
+            invalidatePrerender();
             const selected = cycleSelect.options[cycleSelect.selectedIndex];
             currentCycle = selected.value;
             const fhrs = JSON.parse(selected.dataset.fhrs || '[]');
@@ -3957,6 +3964,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const res = await fetch(url);
                 if (!res.ok) throw new Error('Failed to generate comparison');
                 const blob = await res.blob();
+                // Revoke previous blob URL
+                const oldImg = container.querySelector('img');
+                if (oldImg && oldImg.src && oldImg.src.startsWith('blob:')) URL.revokeObjectURL(oldImg.src);
                 const img = document.createElement('img');
                 img.src = URL.createObjectURL(blob);
                 container.innerHTML = '';
@@ -4022,6 +4032,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 return;
             }
 
+            // Cancel any in-flight request
+            if (xsectAbortController) xsectAbortController.abort();
+            xsectAbortController = new AbortController();
+
             const container = document.getElementById('xsect-container');
             container.innerHTML = '<div class="loading-text">Generating cross-section...</div>';
 
@@ -4040,15 +4054,19 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 `&anomaly=${anomalyMode ? 1 : 0}${modelParam()}`;
 
             try {
-                const res = await fetch(url);
+                const res = await fetch(url, { signal: xsectAbortController.signal });
                 if (!res.ok) throw new Error('Failed to generate');
                 const blob = await res.blob();
+                // Revoke previous blob URL to prevent memory leak
+                const oldImg = document.getElementById('xsect-img');
+                if (oldImg && oldImg.src && oldImg.src.startsWith('blob:')) URL.revokeObjectURL(oldImg.src);
                 const img = document.createElement('img');
                 img.id = 'xsect-img';
                 img.src = URL.createObjectURL(blob);
                 container.innerHTML = '';
                 container.appendChild(img);
             } catch (err) {
+                if (err.name === 'AbortError') return;  // Cancelled by newer request
                 container.innerHTML = `<div style="color:#f87171">${err.message}</div>`;
             }
 
@@ -4878,7 +4896,8 @@ def api_prerender():
                 )
                 if buf:
                     frame_cache_put(cache_key, buf.getvalue())
-                return fhr, True
+                    return fhr, True
+                return fhr, False
             except Exception:
                 return fhr, False
             finally:

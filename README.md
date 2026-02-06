@@ -70,6 +70,8 @@ XSECT_GRIB_BACKEND=auto WXSECTION_KEY=your_key python tools/unified_dashboard.py
 - **Parallel prerender** - ThreadPool(8) batch rendering, ~4s for 19 frames (was ~10s sequential)
 - **Two-phase preload**: cached FHRs load instantly (Phase 1), GRIB conversions run in background (Phase 2)
 - **Render semaphore** - caps concurrent matplotlib renders at 12 (8 prerender + 4 live)
+- **Thread-safe rendering** - uses matplotlib OO API (`Figure()`, not `plt.subplots()`) to avoid pyplot global state races
+- **Request cancellation** - `AbortController` cancels stale fetch requests during rapid frame switching
 - **Configurable workers** - `--grib-workers N` / `--preload-workers N` (or env `XSECT_GRIB_WORKERS` / `XSECT_PRELOAD_WORKERS`)
 
 ### Mmap Cache Architecture

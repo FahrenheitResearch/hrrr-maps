@@ -2272,8 +2272,8 @@ class InteractiveCrossSection:
         """
         import matplotlib
         matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
         import matplotlib.colors as mcolors
+        from matplotlib.figure import Figure
         from matplotlib.ticker import MultipleLocator
         from datetime import datetime, timedelta
 
@@ -2333,7 +2333,8 @@ class InteractiveCrossSection:
         # Create figure - 25% larger with room for inset above and labels below
         base_height = 11.0
         fig_height = base_height * min(max(vscale, 0.5), 3.0)
-        fig, ax = plt.subplots(figsize=(17, fig_height), facecolor='white')
+        fig = Figure(figsize=(17, fig_height), facecolor='white')
+        ax = fig.add_subplot(111)
         ax.set_position([0.06, 0.12, 0.82, 0.68])  # Room above for inset, below for labels
 
         # Determine Y coordinate based on y_axis choice
@@ -2422,7 +2423,7 @@ class InteractiveCrossSection:
             cf = ax.contourf(X, Y, anomaly_field, levels=levels_anom,
                             cmap='RdBu_r', extend='both')
             cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-            cbar = plt.colorbar(cf, cax=cbar_ax)
+            cbar = fig.colorbar(cf, cax=cbar_ax)
 
             cbar_label, shading_label = _ANOMALY_LABELS.get(
                 style, (f'{style} Anomaly', f'{style} Anomaly'))
@@ -2450,7 +2451,7 @@ class InteractiveCrossSection:
             # Fine resolution levels for smooth gradient (every 2 kts)
             cf = ax.contourf(X, Y, wind_speed, levels=np.arange(0, 102, 2), cmap=wspd_cmap, extend='max')
             cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-            cbar = plt.colorbar(cf, cax=cbar_ax)
+            cbar = fig.colorbar(cf, cax=cbar_ax)
             cbar.set_label('Wind Speed (kts)')
             shading_label = "Wind Speed"
         elif style == "temp":
@@ -2460,7 +2461,7 @@ class InteractiveCrossSection:
                 cmap_obj = self._build_temp_colormap(temp_cmap)
                 cf = ax.contourf(X, Y, temp_c, levels=np.arange(-66, 56, 2), cmap=cmap_obj, extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Temperature (°C)')
                 shading_label = "T(°C)"
         elif style == "rh":
@@ -2472,7 +2473,7 @@ class InteractiveCrossSection:
                 rh_cmap = mcolors.LinearSegmentedColormap.from_list('rh', rh_colors, N=256)
                 cf = ax.contourf(X, Y, rh, levels=np.arange(0, 105, 5), cmap=rh_cmap, extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Relative Humidity (%)')
                 shading_label = "RH(%)"
         elif style == "omega":
@@ -2483,7 +2484,7 @@ class InteractiveCrossSection:
                 cf = ax.contourf(X, Y, omega_display, levels=np.linspace(-omega_max, omega_max, 21),
                                 cmap='RdBu_r', extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('ω (hPa/hr)')
                 shading_label = "ω"
         elif style == "theta_e":
@@ -2491,7 +2492,7 @@ class InteractiveCrossSection:
             if theta_e is not None:
                 cf = ax.contourf(X, Y, theta_e, levels=np.arange(280, 365, 4), cmap='Spectral_r', extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('θₑ (K)')
                 shading_label = "θₑ"
         elif style == "shear":
@@ -2499,7 +2500,7 @@ class InteractiveCrossSection:
             if shear is not None:
                 cf = ax.contourf(X, Y, shear, levels=np.linspace(0, 10, 11), cmap='OrRd', extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Shear (10⁻³/s)')
                 shading_label = "Shear"
         elif style == "q":
@@ -2508,7 +2509,7 @@ class InteractiveCrossSection:
                 q_gkg = q * 1000  # kg/kg to g/kg
                 cf = ax.contourf(X, Y, q_gkg, levels=np.arange(0, 21, 1), cmap='YlGnBu', extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Specific Humidity (g/kg)')
                 shading_label = "q"
         elif style == "cloud_total":
@@ -2529,7 +2530,7 @@ class InteractiveCrossSection:
                 cloud_cmap = mcolors.LinearSegmentedColormap.from_list('cloud', cloud_colors, N=256)
                 cf = ax.contourf(X, Y, cloud_gkg, levels=np.linspace(0, 1.0, 11), cmap=cloud_cmap, extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Total Condensate (g/kg)')
                 shading_label = "Cloud"
         elif style == "cloud":
@@ -2538,7 +2539,7 @@ class InteractiveCrossSection:
                 cloud_gkg = cloud * 1000
                 cf = ax.contourf(X, Y, cloud_gkg, levels=np.linspace(0, 0.5, 11), cmap='Blues', extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Cloud LWC (g/kg)')
                 shading_label = "Cloud"
         elif style == "lapse_rate":
@@ -2547,7 +2548,7 @@ class InteractiveCrossSection:
                 # Diverging colormap: blue (stable) -> white -> red (unstable)
                 cf = ax.contourf(X, Y, lapse, levels=np.linspace(0, 12, 13), cmap='RdYlBu_r', extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Lapse Rate (°C/km)')
                 # Add dry adiabatic line
                 ax.contour(X, Y, lapse, levels=[9.8], colors='black', linewidths=2, linestyles='--')
@@ -2557,7 +2558,7 @@ class InteractiveCrossSection:
             if wetbulb is not None:
                 cf = ax.contourf(X, Y, wetbulb, levels=np.arange(-40, 35, 5), cmap='coolwarm', extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Wet-Bulb Temp (°C)')
                 # Wet-bulb 0°C line (critical for precip type)
                 try:
@@ -2583,7 +2584,7 @@ class InteractiveCrossSection:
                 icing_cmap = mcolors.LinearSegmentedColormap.from_list('icing', icing_colors, N=256)
                 cf = ax.contourf(X, Y, icing, levels=np.linspace(0, 0.3, 7), cmap=icing_cmap, extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Icing (SLW g/kg)')
                 shading_label = "Icing"
         elif style == "vorticity":
@@ -2594,7 +2595,7 @@ class InteractiveCrossSection:
                 cf = ax.contourf(X, Y, vort_scaled, levels=np.linspace(-vort_max, vort_max, 21),
                                 cmap='RdBu_r', extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Vorticity (10⁻⁵/s)')
                 shading_label = "ζ"
         elif style == "smoke":
@@ -2648,7 +2649,7 @@ class InteractiveCrossSection:
                     ticks = [t for t in ticks if t <= levels[-1]]
                 else:
                     ticks = None
-                cbar = plt.colorbar(cf, cax=cbar_ax, ticks=ticks)
+                cbar = fig.colorbar(cf, cax=cbar_ax, ticks=ticks)
                 cbar.set_label('PM2.5 (μg/m³)')
 
 
@@ -2669,7 +2670,7 @@ class InteractiveCrossSection:
                 levels = np.linspace(-2, 2, 21)
                 cf = ax.contourf(X, Y, fronto, levels=levels, cmap=fronto_cmap, extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Frontogenesis (K/100km/3hr)')
 
                 # Highlight strong frontogenesis bands
@@ -2689,7 +2690,7 @@ class InteractiveCrossSection:
                 vpd_cmap = mcolors.LinearSegmentedColormap.from_list('vpd', vpd_colors, N=256)
                 cf = ax.contourf(X, Y, vpd, levels=np.arange(0, 65, 5), cmap=vpd_cmap, extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('VPD (hPa)')
                 shading_label = "VPD"
         elif style == "dewpoint_dep":
@@ -2701,7 +2702,7 @@ class InteractiveCrossSection:
                 dd_cmap = mcolors.LinearSegmentedColormap.from_list('dd', dd_colors, N=256)
                 cf = ax.contourf(X, Y, dd, levels=np.arange(0, 42, 2), cmap=dd_cmap, extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Dewpoint Depression (°C)')
                 # Saturation line (dd=0)
                 try:
@@ -2715,7 +2716,7 @@ class InteractiveCrossSection:
             if mt is not None:
                 cf = ax.contourf(X, Y, mt, levels=np.linspace(0, 200, 21), cmap='YlGnBu', extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Moisture Transport (g·m/kg/s)')
                 shading_label = "q·V"
         elif style == "pv":
@@ -2728,7 +2729,7 @@ class InteractiveCrossSection:
                 pv_cmap = mcolors.LinearSegmentedColormap.from_list('pv', pv_colors, N=256)
                 cf = ax.contourf(X, Y, pv, levels=np.arange(-2, 10.5, 0.5), cmap=pv_cmap, extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Potential Vorticity (PVU)')
                 # 2 PVU dynamical tropopause
                 try:
@@ -2742,7 +2743,7 @@ class InteractiveCrossSection:
             if theta is not None:
                 cf = ax.contourf(X, Y, theta, levels=np.arange(270, 360, 4), cmap='viridis', extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
-                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('θ (K)')
                 shading_label = "θ"
 
@@ -2825,6 +2826,8 @@ class InteractiveCrossSection:
             # Prefer native high-res terrain from extraction
             sp_hires = data.get('surface_pressure_hires')
             dist_hires = data.get('distances_hires')
+            if dist_hires is not None:
+                dist_hires = dist_hires * dist_scale
 
             if sp_hires is None or dist_hires is None:
                 # Fallback: use native ~3km HRRR resolution
@@ -3012,11 +3015,12 @@ class InteractiveCrossSection:
 
         # Save to bytes (don't use tight_layout or bbox_inches - conflicts with inset positioning)
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=dpi, facecolor='white')
-        plt.close(fig)
+        fig.savefig(buf, format='png', dpi=dpi, facecolor='white')
         buf.seek(0)
-
-        return buf.read()
+        result = buf.read()
+        fig.clear()
+        del fig
+        return result
 
     def get_loaded_hours(self) -> List[int]:
         """Get list of loaded forecast hours."""
