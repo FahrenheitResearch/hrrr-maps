@@ -1080,14 +1080,13 @@ class CrossSectionManager:
                     self.loaded_items.remove((ck, fhr))
             self._unload_item(ck, fhr)
 
+        # Collect all FHRs to load across all target cycles for progress tracking
+        all_work = []  # [(cycle, cycle_key, fhr, is_cached)]
         newest = priority_cycles[0] if priority_cycles else None
         for cycle in priority_cycles:
             cycle_key = cycle['cycle_key']
-            run_path = Path(cycle['path'])
             is_synoptic = cycle.get('is_synoptic', False)
 
-            # Synoptic HRRR cycles: load ALL available FHRs (F00-F48)
-            # Regular cycles: only load base FHRs (F00-F18)
             if is_synoptic and self.model_name == 'hrrr':
                 allowed_fhrs = cycle['available_fhrs']
             else:
@@ -1101,73 +1100,100 @@ class CrossSectionManager:
                 continue
 
             fhrs_to_load = self._priority_sort_fhrs(fhrs_to_load)
-            is_newest = (cycle_key == newest['cycle_key'])
 
-            # Partition into cached (fast) vs uncached (slow GRIB) — load cached first
+            # Partition into cached vs uncached
             cache_dir = Path(f'{self.CACHE_BASE}/{self.model_name}')
-            cached_fhrs = []
-            uncached_fhrs = []
             for fhr in fhrs_to_load:
                 prs_files = list((Path(cycle['path']) / f"F{fhr:02d}").glob(self._prs_pattern))
+                is_cached = False
                 if prs_files:
                     stem = self.xsect._get_cache_stem(str(prs_files[0]))
                     if stem and (cache_dir / stem).is_dir():
-                        cached_fhrs.append(fhr)
-                    else:
-                        uncached_fhrs.append(fhr)
-                else:
-                    uncached_fhrs.append(fhr)
-            fhrs_to_load = cached_fhrs + uncached_fhrs
+                        is_cached = True
+                all_work.append((cycle, cycle_key, fhr, is_cached))
 
-            def _make_loader(c, ck):
-                def _load_one(fhr):
-                    with self._lock:
-                        if (ck, fhr) in self.loaded_items:
-                            return fhr, True
-                        self.xsect.init_date = c['date']
-                        self.xsect.init_hour = c['hour']
-                        self._evict_if_needed()
-                        engine_key = self._get_engine_key(ck, fhr)
+        if not all_work:
+            return
 
-                    prs_files = list((Path(c['path']) / f"F{fhr:02d}").glob(self._prs_pattern))
-                    if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
-                        with self._lock:
-                            if (ck, fhr) not in self.loaded_items:
-                                self.loaded_items.append((ck, fhr))
+        # Sort: cached first, then uncached
+        all_work.sort(key=lambda x: (not x[3], x[1], x[2]))
+
+        n_cached = sum(1 for _, _, _, c in all_work if c)
+        n_uncached = len(all_work) - n_cached
+
+        # Progress tracking
+        op_id = f"autoload:{self.model_name}"
+        cycle_keys = sorted(set(ck for _, ck, _, _ in all_work))
+        cycle_label = cycle_keys[0] if len(cycle_keys) == 1 else f"{len(cycle_keys)} cycles"
+        progress_update(op_id, 0, len(all_work), "Starting...",
+                        label=f"Loading {self.model_name.upper()} {cycle_label} ({n_cached} cached, {n_uncached} GRIB)")
+
+        completed = [0]
+
+        def _make_loader(c, ck):
+            def _load_one(fhr):
+                with self._lock:
+                    if (ck, fhr) in self.loaded_items:
                         return fhr, True
-                    return fhr, False
-                return _load_one
+                    self.xsect.init_date = c['date']
+                    self.xsect.init_hour = c['hour']
+                    self._evict_if_needed()
+                    engine_key = self._get_engine_key(ck, fhr)
 
-            _load_one = _make_loader(cycle, cycle_key)
+                prs_files = list((Path(c['path']) / f"F{fhr:02d}").glob(self._prs_pattern))
+                if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
+                    with self._lock:
+                        if (ck, fhr) not in self.loaded_items:
+                            self.loaded_items.append((ck, fhr))
+                    return fhr, True
+                return fhr, False
+            return _load_one
 
-            n_cached = len(cached_fhrs)
-            priority = " [PRIORITY]" if is_newest else ""
-            synoptic_tag = " [48h SYNOPTIC]" if is_synoptic and any(f >= 19 for f in fhrs_to_load) else ""
-            logger.info(f"Auto-loading{priority}{synoptic_tag} {cycle['display']} ({n_cached} cached, {len(uncached_fhrs)} GRIB)")
+        def _on_complete(cycle_key, fhr, ok, is_cached):
+            completed[0] += 1
+            tag = "cached" if is_cached else "GRIB"
+            detail = f"{cycle_key} F{fhr:02d} {'OK' if ok else 'FAILED'} ({tag})"
+            progress_update(op_id, completed[0], len(all_work), detail)
+            if ok:
+                logger.info(f"  Auto-loaded {cycle_key} F{fhr:02d} ({tag})")
 
-            # Phase 1: Load cached (fast, thread pool)
-            if cached_fhrs:
-                with ThreadPoolExecutor(max_workers=self.PRELOAD_WORKERS) as pool:
-                    futures = {pool.submit(_load_one, fhr): fhr for fhr in cached_fhrs}
-                    for future in as_completed(futures):
-                        try:
-                            fhr, ok = future.result()
-                            if ok:
-                                logger.info(f"  Auto-loaded {cycle_key} F{fhr:02d} (cached)")
-                        except Exception as e:
-                            logger.warning(f"  Auto-load failed: {e}")
+        # Phase 1: cached (fast)
+        cached_work = [(c, ck, fhr) for c, ck, fhr, is_c in all_work if is_c]
+        if cached_work:
+            with ThreadPoolExecutor(max_workers=self.PRELOAD_WORKERS) as pool:
+                futures = {}
+                for c, ck, fhr in cached_work:
+                    loader = _make_loader(c, ck)
+                    fut = pool.submit(loader, fhr)
+                    futures[fut] = (ck, fhr)
+                for future in as_completed(futures):
+                    ck, fhr = futures[future]
+                    try:
+                        _, ok = future.result()
+                        _on_complete(ck, fhr, ok, True)
+                    except Exception as e:
+                        _on_complete(ck, fhr, False, True)
+                        logger.warning(f"  Auto-load failed: {e}")
 
-            # Phase 2: Convert uncached from GRIB (ThreadPool — avoids WSL2 folio contention)
-            if uncached_fhrs:
-                with ThreadPoolExecutor(max_workers=self.GRIB_WORKERS) as pool:
-                    futures = {pool.submit(_load_one, fhr): fhr for fhr in uncached_fhrs}
-                    for future in as_completed(futures):
-                        try:
-                            fhr, ok = future.result()
-                            if ok:
-                                logger.info(f"  Auto-loaded {cycle_key} F{fhr:02d} (GRIB)")
-                        except Exception as e:
-                            logger.warning(f"  Auto-load failed: {e}")
+        # Phase 2: uncached GRIB conversion (slow)
+        uncached_work = [(c, ck, fhr) for c, ck, fhr, is_c in all_work if not is_c]
+        if uncached_work:
+            with ThreadPoolExecutor(max_workers=self.GRIB_WORKERS) as pool:
+                futures = {}
+                for c, ck, fhr in uncached_work:
+                    loader = _make_loader(c, ck)
+                    fut = pool.submit(loader, fhr)
+                    futures[fut] = (ck, fhr)
+                for future in as_completed(futures):
+                    ck, fhr = futures[future]
+                    try:
+                        _, ok = future.result()
+                        _on_complete(ck, fhr, ok, False)
+                    except Exception as e:
+                        _on_complete(ck, fhr, False, False)
+                        logger.warning(f"  Auto-load failed: {e}")
+
+        progress_done(op_id)
 
     def get_loaded_status(self):
         """Return current memory status."""
@@ -1987,6 +2013,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .progress-item[data-op="preload"] .progress-bar-fill { background: #6366f1; }
         .progress-item[data-op="download"] .progress-bar-fill { background: #f59e0b; }
         .progress-item[data-op="prerender"] .progress-bar-fill { background: #8b5cf6; }
+        .progress-item[data-op="autoload"] .progress-bar-fill { background: #818cf8; }
+        .progress-item[data-op="autoupdate"] .progress-bar-fill { background: #06b6d4; }
         .progress-detail {
             font-size: 11px;
             color: var(--muted);
@@ -3156,8 +3184,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         const OP_ICONS = {
             preload: '\\u25B6',  // play triangle
             load: '\\u2191',     // up arrow
+            autoload: '\\u25B6', // play triangle (same as preload)
             prerender: '\\u25CF',// filled circle
             download: '\\u2193', // down arrow
+            autoupdate: '\\u21BB', // clockwise arrow ↻
         };
 
         function fmtTime(sec) {
@@ -4292,39 +4322,59 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         document.getElementById('memory-status').onclick = async () => {
             try {
-                const res = await fetch(`/api/status?model=${currentModel}`);
-                const data = await res.json();
-                const loaded = data.loaded || [];
-                const memMb = data.memory_mb || 0;
+                // Fetch status for all registered models
+                const modelsRes = await fetch('/api/models');
+                const modelsData = await modelsRes.json();
+                const modelIds = (modelsData.models || []).map(m => m.id);
 
-                if (loaded.length === 0) {
+                const allResults = await Promise.all(
+                    modelIds.map(async m => {
+                        const r = await fetch(`/api/status?model=${m}`);
+                        const d = await r.json();
+                        return { model: m, loaded: d.loaded || [], memory_mb: d.memory_mb || 0 };
+                    })
+                );
+
+                const totalLoaded = allResults.reduce((s, r) => s + r.loaded.length, 0);
+                const totalMb = allResults.reduce((s, r) => s + r.memory_mb, 0);
+
+                if (totalLoaded === 0) {
                     ramModalBody.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;">Nothing loaded in RAM</p>';
                 } else {
-                    // Group by cycle
-                    const groups = {};
-                    loaded.forEach(([cycle, fhr]) => {
-                        if (!groups[cycle]) groups[cycle] = [];
-                        groups[cycle].push(fhr);
-                    });
+                    let html = '';
+                    for (const { model, loaded, memory_mb } of allResults) {
+                        if (loaded.length === 0) continue;
 
-                    let html = '<table><tr><th>Cycle</th><th>Forecast Hours</th><th>~RAM</th></tr>';
-                    const perFhr = loaded.length > 0 ? memMb / loaded.length : 0;
+                        // Group by cycle
+                        const groups = {};
+                        loaded.forEach(([cycle, fhr]) => {
+                            if (!groups[cycle]) groups[cycle] = [];
+                            groups[cycle].push(fhr);
+                        });
 
-                    Object.keys(groups).sort().reverse().forEach(cycle => {
-                        const fhrs = groups[cycle].sort((a,b) => a - b);
-                        const cycleMb = fhrs.length * perFhr;
-                        const fhrStr = fhrs.map(f => 'F' + String(f).padStart(2,'0')).join(', ');
-                        html += `<tr>
-                            <td class="cycle-group">${cycle}</td>
-                            <td>${fhrStr}</td>
-                            <td>${cycleMb >= 1000 ? (cycleMb/1000).toFixed(1) + ' GB' : Math.round(cycleMb) + ' MB'}</td>
-                        </tr>`;
-                    });
+                        const perFhr = loaded.length > 0 ? memory_mb / loaded.length : 0;
+                        const modelMbStr = memory_mb >= 1000 ? (memory_mb/1000).toFixed(1) + ' GB' : Math.round(memory_mb) + ' MB';
 
-                    html += '</table>';
+                        html += `<div style="margin-bottom:8px;"><strong style="color:var(--accent)">${model.toUpperCase()}</strong> <span style="color:var(--muted);font-size:11px;">${loaded.length} FHRs \u00B7 ${modelMbStr}</span></div>`;
+                        html += '<table><tr><th>Cycle</th><th>Forecast Hours</th><th>~RAM</th></tr>';
+
+                        Object.keys(groups).sort().reverse().forEach(cycle => {
+                            const fhrs = groups[cycle].sort((a,b) => a - b);
+                            const cycleMb = fhrs.length * perFhr;
+                            const fhrStr = fhrs.map(f => 'F' + String(f).padStart(2,'0')).join(', ');
+                            html += `<tr>
+                                <td class="cycle-group">${cycle}</td>
+                                <td>${fhrStr}</td>
+                                <td>${cycleMb >= 1000 ? (cycleMb/1000).toFixed(1) + ' GB' : Math.round(cycleMb) + ' MB'}</td>
+                            </tr>`;
+                        });
+                        html += '</table>';
+                    }
+
+                    const totalStr = totalMb >= 1000 ? (totalMb/1000).toFixed(1) + ' GB' : Math.round(totalMb) + ' MB';
                     html += `<div class="summary">
-                        <strong>${loaded.length}</strong> forecast hours loaded &bull;
-                        <strong>${memMb >= 1000 ? (memMb/1000).toFixed(1) + ' GB' : Math.round(memMb) + ' MB'}</strong> total RAM &bull;
+                        <strong>${totalLoaded}</strong> forecast hours loaded &bull;
+                        <strong>${totalStr}</strong> total RAM &bull;
                         <strong>117 GB</strong> cap
                     </div>`;
                     ramModalBody.innerHTML = html;
@@ -4403,6 +4453,22 @@ def api_status():
     mgr = get_manager_from_request() or data_manager
     return jsonify(mgr.get_loaded_status())
 
+AUTO_UPDATE_STATUS_FILE = '/tmp/auto_update_status.json'
+
+def _read_auto_update_status():
+    """Read auto-update status file written by auto_update.py. Returns dict or None."""
+    try:
+        import os
+        stat = os.stat(AUTO_UPDATE_STATUS_FILE)
+        # Skip if stale (>5 min old)
+        if time.time() - stat.st_mtime > 300:
+            return None
+        with open(AUTO_UPDATE_STATUS_FILE, 'r') as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
 @app.route('/api/progress')
 def api_progress():
     """Return all active progress operations."""
@@ -4451,6 +4517,61 @@ def api_progress():
         if eta is not None:
             entry['eta'] = eta
         result[op_id] = entry
+
+    # Inject auto-update progress from status file (written by auto_update.py)
+    au = _read_auto_update_status()
+    if au and au.get('models'):
+        au_started = au.get('started', au.get('ts', now))
+        au_elapsed = round(now - au_started)
+        for model, ms in au['models'].items():
+            op_id = f"autoupdate:{model}"
+            step = ms.get('done', 0)
+            total = ms.get('total', 0)
+            if total <= 0:
+                continue
+            # Skip models that are done (no in-flight, all complete)
+            if step >= total and not ms.get('in_flight'):
+                continue
+            pct = round(100 * step / max(total, 1))
+            flying = ms.get('in_flight', [])
+            last_ok = ms.get('last_ok')
+            last_fail = ms.get('last_fail')
+
+            # Build detail string like: "F05 OK — downloading F06, F07, F08"
+            parts = []
+            if last_ok:
+                parts.append(f"{last_ok} OK")
+            if last_fail:
+                parts.append(f"{last_fail} FAIL")
+            detail = ' · '.join(parts) if parts else 'Starting...'
+            if flying:
+                detail += f" \u2014 downloading {', '.join(flying)}"
+
+            # Compute rate/ETA from elapsed time
+            au_rate = None
+            au_eta = None
+            if step > 0 and au_elapsed > 0:
+                au_rate = step / au_elapsed
+                remaining = total - step
+                if au_rate > 0:
+                    au_eta = round(remaining / au_rate)
+
+            entry = {
+                'label': f"Auto-update {model.upper()} {ms.get('cycle', '')}",
+                'op': 'autoupdate',
+                'step': step,
+                'total': total,
+                'detail': detail,
+                'pct': pct,
+                'elapsed': au_elapsed,
+                'done': False,
+            }
+            if au_rate is not None:
+                entry['rate'] = round(au_rate, 3)
+            if au_eta is not None:
+                entry['eta'] = au_eta
+            result[op_id] = entry
+
     return jsonify(result)
 
 @app.route('/api/cancel', methods=['POST'])

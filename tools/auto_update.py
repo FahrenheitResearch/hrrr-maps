@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 running = True
 OUTPUTS_BASE = Path("outputs")
+STATUS_FILE = Path("/tmp/auto_update_status.json")
 
 SYNOPTIC_HOURS = {0, 6, 12, 18}
 
@@ -76,6 +77,21 @@ MODEL_AVAILABILITY_LAG = {
     'gfs':  240,   # GFS takes ~4 hours to start publishing
     'rrfs': 120,   # RRFS takes ~2 hours
 }
+
+
+def write_status(status_dict):
+    """Atomically write auto-update status to JSON file for dashboard to read."""
+    try:
+        tmp = STATUS_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(status_dict))
+        tmp.rename(STATUS_FILE)
+    except Exception:
+        pass  # Best-effort, don't disrupt downloads
+
+
+def clear_status():
+    """Write idle status (no active downloads)."""
+    write_status({"ts": time.time(), "models": {}})
 
 
 def signal_handler(sig, frame):
@@ -454,6 +470,34 @@ def run_download_pass_concurrent(work_queues, slot_limits, hrrr_max_fhr=None):
     if total_workers <= 0:
         return 0
 
+    # --- Per-model progress tracking for status file ---
+    # Track cycle, totals, completions, in-flight FHRs, and last results per model
+    model_status = {}
+    for model, items in work_queues.items():
+        if items and slot_limits.get(model, 0) > 0:
+            # Determine cycle(s) — use the first item's cycle as primary
+            d0, h0, _ = items[0]
+            model_status[model] = {
+                "cycle": f"{d0}/{h0:02d}z",
+                "total": len(items),
+                "done": 0,
+                "in_flight": [],
+                "last_ok": None,
+                "last_fail": None,
+            }
+    pass_start = time.time()
+
+    def _flush_status():
+        write_status({"ts": time.time(), "started": pass_start, "models": model_status})
+
+    def _update_in_flight():
+        """Rebuild in_flight lists from the actual in_flight futures dict."""
+        flying = {}
+        for fut, (mn, ds, hr, fhr, ts) in in_flight.items():
+            flying.setdefault(mn, []).append(f"F{fhr:02d}")
+        for m in model_status:
+            model_status[m]["in_flight"] = sorted(flying.get(m, []))
+
     def _drop_if_empty(model_name):
         q = queues.get(model_name)
         if q is not None and not q:
@@ -476,6 +520,8 @@ def run_download_pass_concurrent(work_queues, slot_limits, hrrr_max_fhr=None):
             )
         _drop_if_empty(model_name)
 
+    _flush_status()
+
     with ThreadPoolExecutor(max_workers=total_workers) as pool:
         while running and (queues or in_flight):
             # Refresh HRRR queue while other models are still active so newly
@@ -492,9 +538,24 @@ def run_download_pass_concurrent(work_queues, slot_limits, hrrr_max_fhr=None):
                     if refreshed:
                         queues['hrrr'] = deque(refreshed)
                         logger.info(f"[HRRR] Refreshed pending queue: {len(refreshed)} FHRs")
+                        if 'hrrr' in model_status:
+                            model_status['hrrr']['total'] += len(refreshed)
+                        else:
+                            d0, h0, _ = refreshed[0]
+                            model_status['hrrr'] = {
+                                "cycle": f"{d0}/{h0:02d}z",
+                                "total": len(refreshed),
+                                "done": 0,
+                                "in_flight": [],
+                                "last_ok": None,
+                                "last_fail": None,
+                            }
 
             for model_name in model_order:
                 _schedule(model_name, pool)
+
+            _update_in_flight()
+            _flush_status()
 
             if not in_flight:
                 break
@@ -511,11 +572,18 @@ def run_download_pass_concurrent(work_queues, slot_limits, hrrr_max_fhr=None):
                 except Exception as e:
                     logger.warning(f"[{model_name.upper()}] Failed {date_str}/{hour:02d}z F{fhr:02d}: {e}")
 
+                if model_name in model_status:
+                    model_status[model_name]["done"] += 1
+
                 if ok:
                     total_new += 1
                     logger.info(f"[{model_name.upper()}] F{fhr:02d} complete ({dur:.1f}s)")
+                    if model_name in model_status:
+                        model_status[model_name]["last_ok"] = f"F{fhr:02d}"
                 else:
                     logger.info(f"[{model_name.upper()}] F{fhr:02d} unavailable/failed ({dur:.1f}s)")
+                    if model_name in model_status:
+                        model_status[model_name]["last_fail"] = f"F{fhr:02d}"
                     # HRRR fail-fast: if Fxx isn't available, higher FHRs in same cycle
                     # are generally not available either.
                     if model_name == 'hrrr' and 'hrrr' in queues:
@@ -531,8 +599,14 @@ def run_download_pass_concurrent(work_queues, slot_limits, hrrr_max_fhr=None):
                                 f"[HRRR] Pruned {pruned} higher FHRs after unavailable "
                                 f"{date_str}/{hour:02d}z F{fhr:02d}"
                             )
+                            if 'hrrr' in model_status:
+                                model_status['hrrr']['total'] -= pruned
                         _drop_if_empty('hrrr')
 
+            _update_in_flight()
+            _flush_status()
+
+    clear_status()
     return total_new
 
 
@@ -605,6 +679,7 @@ def main():
 
             if not work_queues:
                 logger.info("All models up to date")
+                clear_status()
                 # Sleep and re-check
                 for _ in range(args.interval * 60):
                     if not running:
@@ -635,6 +710,7 @@ def main():
                 break
             time.sleep(1)
 
+    clear_status()
     logger.info("Auto-update service stopped")
 
 

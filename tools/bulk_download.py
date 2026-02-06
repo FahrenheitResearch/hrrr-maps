@@ -180,7 +180,7 @@ def main():
     parser.add_argument('--include-smoke', action='store_true',
                         help='Include wrfnat files for smoke (~7x more data)')
     parser.add_argument('--threads', type=int, default=8,
-                        help='Parallel download threads per init (default: 8)')
+                        help='Parallel download threads (total budget when --pipeline > 1) (default: 8)')
     parser.add_argument('--aws-only', action='store_true',
                         help='Skip NOMADS, download directly from AWS (faster for archive data)')
     parser.add_argument('--pipeline', type=int, default=1,
@@ -270,8 +270,8 @@ def main():
             logger.info(f"[{cycle_idx}/{total_cycles}] {cycle_label} — downloading ({existing}/{n_fhrs} exist)...")
             cycle_start = time.time()
 
-            # Fewer threads per cycle when pipelining to avoid overwhelming
-            threads_per = max(4, args.threads // args.pipeline)
+            # Split total thread budget across pipelined cycles
+            threads_per = max(1, args.threads // args.pipeline)
             success, skipped, failed = download_init(
                 output_dir, date_str, hour, args.fhrs, file_types, threads_per, aws_only=args.aws_only
             )

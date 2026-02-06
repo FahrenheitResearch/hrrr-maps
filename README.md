@@ -52,6 +52,9 @@ XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=your_key python tools/unified_dashboard.
 - **Temperature colormap picker** - 4 color tables (Standard, Green-Purple, White at 0C, NWS Classic)
 - **Time slider + auto-play** - play/pause with 0.5x-4x speed, pre-render for instant scrubbing
 - **Cycle comparison mode** - side-by-side Same FHR or Valid Time matching across different init cycles
+- **Activity panel** - real-time progress for all operations (preload, auto-load, download, prerender, auto-update)
+- **Auto-update progress** - per-model download status (HRRR/GFS/RRFS) via status file IPC with auto_update daemon
+- **RAM status modal** - shows all models (HRRR + GFS + RRFS) with per-cycle FHR counts and memory estimates
 - **Cancel operations** - admin can cancel pre-render and download jobs via X button in progress panel
 - **Archive request modal** - calendar date picker, hour selector, FHR range for downloading historical data
 - **Load All button** - loads all FHRs for the current cycle at once (available to all users)
@@ -80,6 +83,7 @@ XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=your_key python tools/unified_dashboard.
 - **Per-model lanes** - slow RRFS downloads can't block HRRR/GFS progress
 - **HRRR fail-fast** - unavailable FHRs prune higher FHRs from same cycle
 - **HRRR refresh** - re-scans for newly published FHRs every 45s while other models download
+- **Status file IPC** - writes progress to `/tmp/auto_update_status.json` for dashboard activity panel
 - **Single-cycle targeting** - only downloads latest available cycle per model (no handoff)
 - **Extended 48h** for HRRR synoptic cycles (00/06/12/18z)
 - **Configurable**: `--hrrr-slots 3 --gfs-slots 1 --rrfs-slots 1`
@@ -150,7 +154,9 @@ tools/
 │   ├── Two-tier NVMe eviction       # Preload rotation + size-based archive eviction
 │   ├── Cancel system                # CANCEL_FLAGS + admin API for pre-render/download abort
 │   ├── Archive request modal        # Calendar + hour + FHR range, download + auto-load
-│   ├── Progress tracking            # Real-time in-flight FHR display
+│   ├── Activity panel               # Real-time progress for all ops (preload/autoload/download/autoupdate)
+│   ├── Auto-update injection        # Reads /tmp/auto_update_status.json for download progress
+│   ├── RAM status modal             # Multi-model memory view (HRRR + GFS + RRFS)
 │   ├── Frame prerender cache        # 500-entry server-side PNG cache
 │   ├── Community favorites          # Save/load/delete with 12h expiry
 │   └── Admin key system             # WXSECTION_KEY env var
@@ -159,6 +165,7 @@ tools/
 │   ├── Concurrent slots             # 3 HRRR + 1 GFS + 1 RRFS in parallel
 │   ├── HRRR fail-fast               # Prunes unavailable FHRs from queue
 │   ├── Extended 48h                 # Synoptic HRRR cycles get F19-F48
+│   ├── Status file IPC              # Atomic JSON writes to /tmp/auto_update_status.json
 │   └── Space-based cleanup          # Evicts least-popular when disk full
 │
 ├── build_climatology.py             # Build monthly climatology NPZ from archived HRRR

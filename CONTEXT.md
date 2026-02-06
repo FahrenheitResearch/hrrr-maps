@@ -16,44 +16,53 @@ cd ~/hrrr-maps && ./start.sh
 Or manually:
 ```bash
 sudo mount /dev/sde /mnt/hrrr
-nohup python tools/auto_update.py --interval 2 --models hrrr,gfs,rrfs > /tmp/auto_update.log 2>&1 &
+nohup python tools/auto_update.py --interval 2 --models hrrr,gfs,rrfs \
+    --hrrr-slots 3 --gfs-slots 1 --rrfs-slots 1 > /tmp/auto_update.log 2>&1 &
 XSECT_GRIB_BACKEND=cfgrib WXSECTION_KEY=cwtc nohup python3 tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs > /tmp/dashboard.log 2>&1 &
 nohup cloudflared tunnel run wxsection > /tmp/cloudflared.log 2>&1 &
 ```
 
 ---
 
-## COMPLETED: NVMe Cache Migration
+## CRITICAL ISSUE: GRIB-to-mmap Conversion Bottleneck
 
-### What Changed
-- **Deleted stale 371GB cache** at `~/hrrr-maps/cache/dashboard/` (was unused, left over from old config)
-- **Moved CACHE_BASE to NVMe**: `/home/drew/hrrr-maps/cache/xsect` (was `/mnt/hrrr/cache/xsect` on VHD)
-- **Updated `start.sh`** to create NVMe cache dir instead of VHD cache dir
-- **NVMe free after migration**: ~1.4TB (was 963GB before deleting stale cache)
-- **Old VHD cache** at `/mnt/hrrr/cache/xsect/` (~348GB) is now orphaned and can be deleted to free VHD space
-
-### Performance Impact
-- GRIB-to-mmap conversion improved from ~50s/FHR (VHD) to ~23s/FHR (NVMe) — **2x faster**
-- Cache writes no longer compete with GRIB reads for VHD I/O bandwidth
-- Mmap page faults for cached data now served from NVMe instead of external VHD
-
----
-
-## CRITICAL ISSUES & PERFORMANCE PROBLEMS
-
-### 1. GRIB-to-mmap Conversion (~23s/FHR on NVMe, was ~50s on VHD)
+### The Problem (~23s/FHR on NVMe, was ~50s on VHD)
 - **cfgrib** does extensive Python-level work between eccodes C calls — dominated by GIL contention
 - 20 threads = 0 completions in 3+ min (99/102 threads on `futex_wait_queue`)
-- 4 ThreadPool workers is the only stable config
-- **ProcessPoolExecutor fails on WSL2**: `folio_wait_bit_common` kernel-level contention when multiple processes do concurrent I/O through Hyper-V virtual block layer. All workers go D-state
-- Full preload of 151 uncached FHRs takes ~58 min at current rate (was ~125 min on VHD)
+- **4 ThreadPool workers is the only stable config** — the current bottleneck
+- Full preload of ~125 uncached FHRs takes ~48 min at current rate
+- This is the #1 performance bottleneck affecting user experience
 
-### 2. WSL2 VHD Folio Contention
-- Both `/dev/sdd` (2TB NVMe VHD) and `/dev/sde` (20TB external VHD) go through Hyper-V virtual block layer
+### What the conversion does (`load_forecast_hour` in cross_section_interactive.py)
+```
+1. Check mmap cache dir → if exists, load in <0.1s (done)
+2. Check legacy .npz cache → if exists, migrate to mmap (rare)
+3. Load from GRIB (the slow path, ~23s):
+   a. cfgrib.open_dataset() for 10 pressure-level fields (t, u, v, r, w, q, gh, absv, clwmr, dpt)
+   b. cfgrib.open_dataset() for surface pressure
+   c. Load smoke PM2.5 from wrfnat file (50 hybrid levels)
+   d. Compute derived fields (theta, temp_c)
+   e. Save all fields to mmap cache (14 fields x 40 levels x 1059x1799)
+```
+
+### Why more threads don't help
+- cfgrib does Python-level iteration between eccodes C calls
+- GIL prevents true parallel execution for Python-bound work
+- At >4 threads, workers spend most time in `futex_wait_queue`
+
+### WSL2 VHD Folio Contention (blocks ProcessPoolExecutor)
+- Both `/dev/sdd` (NVMe VHD) and `/dev/sde` (external VHD) go through Hyper-V virtual block layer
 - Multiple *processes* doing concurrent I/O trigger `folio_wait_bit_common` in WSL2 page cache locking
-- This is NOT disk speed — it's WSL2-specific kernel contention
 - ThreadPoolExecutor (single process) avoids folio; ProcessPoolExecutor triggers it
-- NVMe has less folio pressure than external VHD but still goes through Hyper-V layer
+- This is NOT disk speed — it's WSL2-specific kernel contention
+
+### Possible approaches to investigate
+1. **eccodes Python bindings directly** — skip cfgrib/xarray overhead, extract only needed fields
+2. **cfgrib with `indexpath=''`** — skip GRIB index file generation
+3. **Rust/C GRIB reader** (e.g., wgrib2 subprocess) — extract fields to numpy, bypass Python GIL entirely
+4. **Per-field parallelism** — split the 10+ cfgrib.open_dataset() calls across threads/processes
+5. **subprocess-based parallelism** — spawn separate Python processes for each FHR, avoid GIL. May hit WSL2 folio issues.
+6. **Pre-extract to intermediate format** — auto_update converts GRIB→mmap immediately after download, before dashboard needs it
 
 ---
 
@@ -113,6 +122,10 @@ HRRR fail-fast: if Fxx fails, prunes higher FHRs from same cycle.
 HRRR refresh: re-scans for newly published FHRs every 45s while
   other models are still downloading.
 
+Status file: auto_update writes /tmp/auto_update_status.json with per-model
+  progress (cycle, total, done, in_flight FHRs). Dashboard reads this to
+  show download progress in the activity panel.
+
 Cycle targeting:
   - HRRR: latest 2 cycles (for base FHRs)
   - GFS/RRFS: latest cycle only (no handoff)
@@ -125,6 +138,31 @@ Download throughput (~6-7 MB/s per NOMADS connection):
 
 Bottleneck: NOMADS per-connection speed (~6-7 MB/s), not local bandwidth.
 Safe to bump to ~7-8 total connections before NOMADS may throttle.
+```
+
+### Activity Panel (Progress Tracking)
+```
+Dashboard tracks operations via PROGRESS dict + /api/progress endpoint.
+Frontend polls every 1.5s.
+
+Operation types:
+  preload    (▶ indigo)   — startup preload of target cycles
+  autoload   (▶ lt-indigo)— background rescan auto-load (triggered every 30-60s)
+  load       (↑ default)  — manual FHR load
+  download   (↓ amber)    — archive cycle download (admin-gated)
+  prerender  (● purple)   — batch frame rendering
+  autoupdate (↻ cyan)     — auto_update download progress (read from status file)
+
+Auto-update progress is injected into /api/progress by reading
+  /tmp/auto_update_status.json (written atomically by auto_update.py).
+  Stale files (>5min old) are ignored. Completed models are hidden.
+```
+
+### RAM Status Modal
+```
+Memory button shows all models (HRRR + GFS + RRFS) grouped by model.
+Each model section shows: cycle → forecast hours → ~RAM estimate.
+Fetches /api/status?model=X for each registered model.
 ```
 
 ### Memory Architecture
@@ -172,7 +210,8 @@ HRRR synoptic (49 FHR): ~61GB GRIB, ~113GB cache
 - **15 styles**: wind_speed, temp, theta_e, rh, q, omega, vorticity, shear, lapse_rate, cloud, cloud_total, wetbulb, icing, frontogenesis, smoke
 - **Run picker**: Filtered to preload window + loaded archive cycles only
 - **Archive requests**: Modal with date picker, hour selector, FHR range (admin-gated)
-- **Download progress**: Shows in-flight FHRs in real-time (`Downloading F00, F01, F02, F03 from AWS archive...`)
+- **Activity panel**: Real-time progress for all operations (preload, auto-load, download, prerender, auto-update)
+- **Auto-update progress**: Shows per-model download status (HRRR/GFS/RRFS) via status file IPC
 - **Cancel jobs**: Admin can cancel pre-render and download operations via X button in progress panel
 - **Auto-update**: Slot-based concurrent (3 HRRR + 1 GFS + 1 RRFS in parallel), fail-fast on unavailable, HRRR refresh every 45s
 - **Cache-first preload**: Cached FHRs load in <1s total, GRIB conversions run in background
@@ -181,6 +220,7 @@ HRRR synoptic (49 FHR): ~61GB GRIB, ~113GB cache
 - **Cycle comparison mode**: Side-by-side Same FHR or Valid Time matching
 - **Community favorites**: Save/load cross-section configs
 - **GIF animation**: `/api/xsect_gif`
+- **RAM status modal**: Shows all models (HRRR + GFS + RRFS) with per-cycle FHR counts and memory
 - **Admin key**: `WXSECTION_KEY=cwtc` env var gates archive downloads, cancel ops
 
 ### Controls UI
@@ -196,14 +236,14 @@ start.sh                           # Startup script (mount VHD, start services)
 model_config.py                     # Model registry (HRRR/GFS/RRFS metadata)
 core/cross_section_interactive.py   # Main engine — mmap cache, cartopy cache, KDTree cache
 smart_hrrr/orchestrator.py          # Parallel GRIB downloads (on_complete, on_start, should_cancel)
-tools/auto_update.py                # Slot-based concurrent download daemon
+tools/auto_update.py                # Slot-based concurrent download daemon + status file
 tools/unified_dashboard.py          # Flask dashboard — everything UI + API
 ```
 
 ### Key Constants (unified_dashboard.py)
 ```python
 PRELOAD_WORKERS = 20   # Thread workers for cached mmap loads
-GRIB_WORKERS = 4       # Thread workers for GRIB-to-mmap conversion
+GRIB_WORKERS = 4       # Thread workers for GRIB-to-mmap conversion (THE BOTTLENECK)
 CACHE_BASE = '/home/drew/hrrr-maps/cache/xsect'  # NVMe — fast local storage
 CACHE_LIMIT_GB = 670   # ~290GB preload + ~380GB archive headroom
 RENDER_SEMAPHORE = 12  # 8 prerender + 4 live user requests
@@ -214,6 +254,7 @@ HRRR_HOURLY_CYCLES = 3
 HRRR_SLOTS = 3         # --hrrr-slots: concurrent HRRR downloads
 GFS_SLOTS = 1          # --gfs-slots: concurrent GFS downloads
 RRFS_SLOTS = 1         # --rrfs-slots: concurrent RRFS downloads
+STATUS_FILE = '/tmp/auto_update_status.json'  # IPC to dashboard
 ```
 
 ---
@@ -221,10 +262,9 @@ RRFS_SLOTS = 1         # --rrfs-slots: concurrent RRFS downloads
 ## Known Issues / TODO
 
 1. **Delete orphaned VHD cache**: `rm -rf /mnt/hrrr/cache/xsect/` frees ~348GB on VHD (no longer used after NVMe migration)
-2. **cfgrib is the bottleneck**: No WSL2-compatible parallelism solution found. 4 threads = ~23s/FHR on NVMe
+2. **GRIB-to-mmap is the #1 bottleneck**: 23s/FHR with 4 threads, GIL-bound. See "CRITICAL ISSUE" section above for investigation paths.
 3. **ProcessPoolExecutor broken on WSL2**: folio contention, all workers D-state. Would need native Linux or different GRIB library
-4. **GRIB alternatives**: eccodes Python bindings directly (skip cfgrib/xarray overhead), or cfgrib with `indexpath=''` to skip index
-5. **GFS/RRFS rendering**: Works but needs more testing at extended FHRs
-6. **VHD remount required**: After every WSL/PC restart, run `start.sh` or mount manually
-7. **Background rescan frequency**: HRRR every 30s, others every 60s — could be tunable
-8. **Monitor NVMe space**: Full preload cache = ~400GB, eviction keeps it bounded. Monitor with `df -h /`
+4. **GFS/RRFS rendering**: Works but needs more testing at extended FHRs
+5. **VHD remount required**: After every WSL/PC restart, run `start.sh` or mount manually
+6. **Background rescan frequency**: HRRR every 30s, others every 60s — could be tunable
+7. **Monitor NVMe space**: Full preload cache = ~400GB, eviction keeps it bounded. Monitor with `df -h /`
