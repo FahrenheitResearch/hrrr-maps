@@ -1,10 +1,15 @@
 # wxsection.com Cross-Section API
 
+> **Beta** — This API is functional and actively maintained, but still in beta.
+> Endpoint URLs and parameter names are stable, but response details or default
+> behavior may change. No uptime SLA. If you build something on this, reach out
+> so we know not to break you.
+
 Generate atmospheric cross-section images from HRRR, GFS, and RRFS weather models between any two points. Returns publication-quality PNG images.
 
 **Base URL:** `https://wxsection.com`
 
-No API key required. No authentication. Free to use.
+No API key required. No authentication. Free to use. CORS enabled for browser apps.
 
 ## Quick Start
 
@@ -223,3 +228,5 @@ All products include terrain shading, wind barbs, theta contours, and the 0C fre
 - Images are 1700x1100 PNG, typically 300-500 KB
 - The `cycle=latest` default is recommended for most use cases
 - HRRR/RRFS: points must be within the CONUS domain. GFS: global coverage
+- CORS is enabled on all `/api/v1/` endpoints — safe to call from browser JavaScript
+- This API is in **beta** — core functionality is stable but minor details may evolve

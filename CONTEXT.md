@@ -107,7 +107,7 @@ Partitions FHRs by checking if mmap cache dir exists. Users see data immediately
 ```
 RAM eviction:
   - _auto_load_latest_inner(): evicts loaded FHRs whose cycle is no longer in target window
-  - _evict_if_needed(): memory-pressure backstop at 48GB HRRR / 8GB GFS,RRFS limits
+  - _evict_if_needed(): memory-pressure backstop at 48GB HRRR / 1.5GB GFS / 8GB RRFS limits
   - Protected cycles (current target window) are never evicted from RAM
 
 NVMe cache eviction — two-tier (cache_evict_old_cycles):
@@ -184,11 +184,12 @@ Fetches /api/status?model=X for each registered model.
 ```
 
 ### Memory Architecture
-- **Mmap cache per FHR**: ~2.8GB on disk (40 levels x 1059 x 1799 x 18 float16/32 fields)
+- **Mmap cache per FHR (HRRR)**: ~2.8GB on disk (40 levels x 1059 x 1799 x 18 float16/32 fields)
+- **Mmap cache per FHR (GFS)**: ~50MB on disk (CONUS subset: 40 levels x ~166 x ~333 x 18 fields)
 - **Resident RAM per FHR**: ~100MB (mmap only pages in accessed slices)
 - **~125 FHRs loaded**: ~4-6GB RAM, ~350GB on disk
 - **Heap per FHR**: ~29MB (lats+lons coordinate arrays)
-- **Memory limits**: 48GB HRRR hard cap, 8GB each GFS/RRFS
+- **Memory limits**: 48GB HRRR hard cap, 1.5GB GFS (CONUS subset), 8GB RRFS
 
 ### Disk Layout
 ```

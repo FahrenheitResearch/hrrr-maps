@@ -36,6 +36,17 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+
+@app.after_request
+def add_cors_headers(response):
+    """Allow cross-origin requests for the public v1 API."""
+    if request.path.startswith('/api/v1/'):
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -328,8 +339,15 @@ def cache_evict_old_cycles(managers: dict):
                 cycle_dirs.setdefault(ck, []).append(entry)
 
         # Tier 1: Always evict rotated preload cycles (not target, not loaded, not archive)
+        from datetime import datetime, timedelta
+        archive_cutoff = (datetime.utcnow() - timedelta(days=7)).strftime('%Y%m%d')
         for ck, dirs in cycle_dirs.items():
             if ck in target_keys or ck in loaded_keys or ck in ARCHIVE_CACHE_KEYS:
+                continue
+            # Never auto-evict cycles older than 7 days — they're intentional archive data
+            ck_date = ck.split('_')[0]
+            if ck_date < archive_cutoff:
+                ARCHIVE_CACHE_KEYS.add(ck)
                 continue
             _evict_cache_dirs(dirs, f"{model_name} {ck} (rotated out)")
 
@@ -542,6 +560,33 @@ def progress_cleanup():
 
 CANCEL_FLAGS = {}  # op_id -> True when cancellation requested
 ARCHIVE_CACHE_KEYS = set()  # cycle keys (YYYYMMDD_HHz) from archive requests — persist on NVMe
+
+def _scan_archive_cache_keys():
+    """Scan mmap cache for cycles outside the recent window and register them as archive keys.
+
+    This ensures archive cycles converted by standalone scripts (not via /api/request_cycle)
+    are protected from eviction and appear in the UI dropdown when loaded.
+    """
+    from datetime import datetime, timedelta
+    cache_base = Path('/home/drew/hrrr-maps/cache/xsect')
+    cutoff = (datetime.utcnow() - timedelta(days=7)).strftime('%Y%m%d')
+    seen = set()
+    for model_dir in cache_base.iterdir():
+        if not model_dir.is_dir():
+            continue
+        for entry in model_dir.iterdir():
+            if not entry.is_dir() or not (entry / '_complete').exists():
+                continue
+            # Parse cycle key from dir name: YYYYMMDD_HHz_Fxx_filename
+            parts = entry.name.split('_')
+            if len(parts) >= 2 and len(parts[0]) == 8 and parts[0].isdigit():
+                date_str = parts[0]
+                if date_str < cutoff:
+                    ck = f"{parts[0]}_{parts[1]}"
+                    seen.add(ck)
+    return seen
+
+ARCHIVE_CACHE_KEYS.update(_scan_archive_cache_keys())
 
 def cancel_request(op_id):
     """Request cancellation of an operation."""
@@ -908,7 +953,7 @@ class CrossSectionManager:
                 ck = parts[2].replace('/', '_')
                 active_keys.add(ck)
 
-        visible_keys = target_keys | loaded_keys | active_keys
+        visible_keys = target_keys | loaded_keys | active_keys | ARCHIVE_CACHE_KEYS
 
         return [
             {
@@ -1099,7 +1144,8 @@ class CrossSectionManager:
         # Evict FHRs from cycles that are no longer targeted
         target_keys = {c['cycle_key'] for c in priority_cycles}
         with self._lock:
-            to_evict = [(ck, fhr) for ck, fhr in self.loaded_items if ck not in target_keys]
+            to_evict = [(ck, fhr) for ck, fhr in self.loaded_items
+                        if ck not in target_keys and ck not in ARCHIVE_CACHE_KEYS]
         for ck, fhr in to_evict:
             logger.info(f"  Evicting {ck} F{fhr:02d} (no longer in target cycles)")
             with self._lock:
@@ -1487,8 +1533,14 @@ class CrossSectionManager:
         fhr_data = self.xsect.forecast_hours.get(engine_key)
         if fhr_data is None:
             return None
-        n_points = 100
         import numpy as np
+        # Adaptive n_points: ~1 per 3km, clamped [50, 1000]
+        lat1, lon1 = np.radians(start[0]), np.radians(start[1])
+        lat2, lon2 = np.radians(end[0]), np.radians(end[1])
+        dlat, dlon = lat2 - lat1, lon2 - lon1
+        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+        dist_km = 6371 * 2 * np.arcsin(np.sqrt(a))
+        n_points = int(np.clip(dist_km / 3.0, 50, 1000))
         path_lats = np.linspace(start[0], end[0], n_points)
         path_lons = np.linspace(start[1], end[1], n_points)
         data = self.xsect._interpolate_to_path(fhr_data, path_lats, path_lons, style)

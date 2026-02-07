@@ -115,6 +115,96 @@ ANOMALY_STYLES = {
 }
 
 
+# GFS CONUS subset bounds (CONUS_BOUNDS ± 5° padding)
+# Subsetting at extraction time reduces GFS from 721x1440 global → ~166x333 CONUS,
+# cutting cache from ~500MB to ~50MB per FHR and RAM from ~8GB to ~1.5GB.
+GFS_CONUS_SUBSET = {
+    'south': 16.14, 'north': 57.62,
+    'west': -139.10, 'east': -55.92,
+}
+
+
+def _subset_to_conus(fhr_data: ForecastHourData) -> ForecastHourData:
+    """Subset a GFS ForecastHourData from global 0.25° grid to CONUS region.
+
+    Handles both 1D (regular) and 2D (curvilinear) lat/lon grids.
+    Converts 0-360 longitudes to -180..180 if needed.
+    Returns a new ForecastHourData with 1D lat/lon vectors.
+    """
+    lats = fhr_data.lats
+    lons = fhr_data.lons
+
+    # Extract 1D vectors from potentially 2D grids
+    if lats.ndim == 2:
+        lat_1d = lats[:, 0]
+        lon_1d = lons[0, :]
+    else:
+        lat_1d = lats
+        lon_1d = lons
+
+    # Convert 0-360 to -180..180 if needed
+    if lon_1d.max() > 180:
+        lon_1d = np.where(lon_1d > 180, lon_1d - 360, lon_1d)
+
+    b = GFS_CONUS_SUBSET
+
+    # Find lat indices (GFS lats may be descending: 90 → -90)
+    lat_mask = (lat_1d >= b['south']) & (lat_1d <= b['north'])
+    lat_indices = np.where(lat_mask)[0]
+    if len(lat_indices) == 0:
+        print("  WARNING: GFS subset found no matching latitudes, skipping subset")
+        return fhr_data
+    lat_slice = slice(lat_indices[0], lat_indices[-1] + 1)
+
+    # Find lon indices
+    lon_mask = (lon_1d >= b['west']) & (lon_1d <= b['east'])
+    lon_indices = np.where(lon_mask)[0]
+    if len(lon_indices) == 0:
+        print("  WARNING: GFS subset found no matching longitudes, skipping subset")
+        return fhr_data
+    lon_slice = slice(lon_indices[0], lon_indices[-1] + 1)
+
+    old_ny, old_nx = len(lat_1d), len(lon_1d)
+    new_lat = lat_1d[lat_slice]
+    new_lon = lon_1d[lon_slice]
+    new_ny, new_nx = len(new_lat), len(new_lon)
+    reduction = 100 * (1 - (new_ny * new_nx) / (old_ny * old_nx))
+    print(f"  GFS subset: {old_ny}x{old_nx} -> {new_ny}x{new_nx} ({reduction:.0f}% reduction)")
+
+    result = ForecastHourData(
+        forecast_hour=fhr_data.forecast_hour,
+        pressure_levels=fhr_data.pressure_levels,
+        lats=new_lat,
+        lons=new_lon,
+    )
+
+    # Slice all 3D fields: (n_levels, lat, lon)
+    for field_name in ('temperature', 'u_wind', 'v_wind', 'rh', 'omega',
+                       'specific_humidity', 'geopotential_height', 'vorticity',
+                       'cloud', 'dew_point', 'ice', 'rain', 'snow', 'graupel',
+                       'theta', 'temp_c'):
+        arr = getattr(fhr_data, field_name, None)
+        if arr is not None and arr.ndim == 3:
+            setattr(result, field_name, arr[:, lat_slice, lon_slice])
+
+    # Slice 2D fields: (lat, lon)
+    for field_name in ('surface_pressure',):
+        arr = getattr(fhr_data, field_name, None)
+        if arr is not None and arr.ndim == 2:
+            setattr(result, field_name, arr[lat_slice, lon_slice])
+
+    # Smoke hybrid fields: (n_hyb, lat, lon)
+    for field_name in ('smoke_hyb', 'smoke_pres_hyb'):
+        arr = getattr(fhr_data, field_name, None)
+        if arr is not None and arr.ndim == 3:
+            setattr(result, field_name, arr[:, lat_slice, lon_slice])
+
+    # Copy non-array fields
+    result.grib_file = fhr_data.grib_file
+
+    return result
+
+
 # Standalone function for multiprocessing (must be at module level for pickle)
 def _load_hour_process(
     grib_file: str,
@@ -399,6 +489,10 @@ def _load_hour_process(
             scale = (1000.0 / np.asarray(fhr_data.pressure_levels, dtype=np.float32)) ** 0.286
             fhr_data.theta = fhr_data.temperature * scale[:, None, None]
             fhr_data.temp_c = fhr_data.temperature - 273.15
+
+        # Subset GFS from global grid to CONUS region
+        if 'gfs.' in Path(grib_file).name.lower():
+            fhr_data = _subset_to_conus(fhr_data)
 
         duration = time.perf_counter() - start
         print(f"  Loaded F{forecast_hour:02d} in {duration:.1f}s ({fhr_data.memory_usage_mb():.0f} MB) using {backend_used}")
@@ -817,6 +911,11 @@ class InteractiveCrossSection:
             return f"only {n_levels} levels (expected {self.min_levels})"
         if fhr_data.surface_pressure is None:
             return "missing surface_pressure (needed for terrain)"
+        # Reject old GFS global-grid cache (721 lat rows) — forces re-extraction with CONUS subset
+        if getattr(self, 'model', '').upper() == 'GFS':
+            lat_rows = fhr_data.lats.shape[0]
+            if lat_rows > 300:
+                return f"GFS global grid ({lat_rows} lat rows) — needs CONUS subset re-extraction"
         return None
 
     def _discard_cache(self, path: Path, reason: str):
@@ -1233,6 +1332,10 @@ class InteractiveCrossSection:
                 scale = (1000.0 / np.asarray(fhr_data.pressure_levels, dtype=np.float32)) ** 0.286
                 fhr_data.theta = fhr_data.temperature * scale[:, None, None]
                 fhr_data.temp_c = fhr_data.temperature - 273.15
+
+            # Subset GFS from global grid to CONUS region
+            if getattr(self, 'model', '').upper() == 'GFS':
+                fhr_data = _subset_to_conus(fhr_data)
 
             # Validate before storing — don't cache incomplete data
             err = self._validate_fhr_data(fhr_data)
@@ -1696,7 +1799,7 @@ class InteractiveCrossSection:
         end_point: Tuple[float, float],
         style: str = "wind_speed",
         forecast_hour: int = 0,
-        n_points: int = 100,
+        n_points: int = 0,
         return_image: bool = True,
         dpi: int = 100,
         y_axis: str = "pressure",
@@ -1717,7 +1820,7 @@ class InteractiveCrossSection:
             end_point: (lat, lon) end
             style: Cross-section style
             forecast_hour: Which forecast hour to use
-            n_points: Points along path
+            n_points: Points along path (0 = adaptive ~1 per 3km, clamped 50-1000)
             return_image: If True, return PNG bytes; if False, return data dict
             dpi: Output resolution
             y_axis: 'pressure' (hPa) or 'height' (km)
@@ -1740,6 +1843,15 @@ class InteractiveCrossSection:
 
         # Get pre-loaded data
         fhr_data = self.forecast_hours[forecast_hour]
+
+        # Adaptive n_points: ~1 point per 3km (HRRR native), clamped to [50, 1000]
+        if n_points <= 0:
+            lat1, lon1 = np.radians(start_point[0]), np.radians(start_point[1])
+            lat2, lon2 = np.radians(end_point[0]), np.radians(end_point[1])
+            dlat, dlon = lat2 - lat1, lon2 - lon1
+            a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+            dist_km = 6371 * 2 * np.arcsin(np.sqrt(a))
+            n_points = int(np.clip(dist_km / 3.0, 50, 1000))
 
         # Create path
         path_lats = np.linspace(start_point[0], end_point[0], n_points)
@@ -2730,7 +2842,7 @@ class InteractiveCrossSection:
                 vpd_colors = ['#1a9850', '#66bd63', '#a6d96a', '#d9ef8b',
                               '#fee08b', '#fdae61', '#f46d43', '#d73027', '#a50026']
                 vpd_cmap = mcolors.LinearSegmentedColormap.from_list('vpd', vpd_colors, N=256)
-                cf = ax.contourf(X, Y, vpd, levels=np.arange(0, 65, 5), cmap=vpd_cmap, extend='max')
+                cf = ax.contourf(X, Y, vpd, levels=np.linspace(0, 10, 21), cmap=vpd_cmap, extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
                 cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('VPD (hPa)')

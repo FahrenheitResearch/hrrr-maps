@@ -17,7 +17,8 @@ start.sh                      — Production startup (mount VHD, start services,
 
 ## Key Design Decisions
 
-- **Mmap cache on NVMe**: GRIB files are converted to raw numpy arrays (~2.8GB/FHR on disk, ~100MB resident RAM). This is what makes instant cross-sections possible.
+- **Mmap cache on NVMe**: GRIB files are converted to raw numpy arrays (~2.8GB/FHR HRRR, ~50MB/FHR GFS on disk, ~100MB resident RAM). This is what makes instant cross-sections possible.
+- **GFS CONUS subset**: GFS global 0.25° grid (721x1440) is subset to CONUS+5° padding (~166x333) at extraction time. Cuts GFS cache from ~500MB to ~50MB/FHR on disk, RAM from ~8GB to ~1.5GB. Old global-grid caches auto-invalidate on load.
 - **eccodes `auto` backend**: Default GRIB backend tries eccodes direct (one-pass scan, ~35% faster), falls back to cfgrib. Configurable via `XSECT_GRIB_BACKEND` env var.
 - **Lazy smoke loading**: wrfnat files (652MB, 50 hybrid levels) loaded on-demand on first `smoke` style request, not during preload. `ForecastHourData.grib_file` stores source path for deferred resolution.
 - **Single-process, threaded**: WSL2 folio contention breaks ProcessPoolExecutor. Everything runs in one process with ThreadPoolExecutor.
@@ -63,7 +64,7 @@ Logs: `/tmp/dashboard.log`, `/tmp/auto_update.log`, `/tmp/cloudflared.log`
 
 1. **GRIB conversion is GIL-bound**: eccodes/cfgrib can't parallelize beyond 3-4 threads. Don't try ProcessPoolExecutor — folio contention on WSL2.
 2. **matplotlib OO API required**: Uses `Figure()` + `fig.add_subplot()` (not `plt.subplots()`) to avoid pyplot global state races under ThreadPoolExecutor. All colorbar/savefig calls go through `fig.` not `plt.`.
-3. **Memory budget**: HRRR 48GB, GFS 8GB, RRFS 8GB. Mmap keeps resident small but monitor with `/api/status`.
+3. **Memory budget**: HRRR 48GB, GFS 1.5GB (CONUS subset), RRFS 8GB. Mmap keeps resident small but monitor with `/api/status`.
 4. **NVMe space**: 1TB cache limit enforced by `cache_evict_old_cycles()`. Monitor with `df -h /`.
 5. **VHD must be mounted**: `/mnt/hrrr` needs `sudo mount /dev/sde /mnt/hrrr` after every WSL restart.
 6. **Smoke loading is lazy**: wrfnat (652MB, 50 hybrid levels) only loaded on first `style=smoke` request, not during preload. Saves ~100s on startup.
@@ -107,8 +108,12 @@ See [API_GUIDE.md](API_GUIDE.md) for full documentation.
 ## Common Tasks
 
 ### Restart dashboard
+IMPORTANT: Must be two separate commands. Chaining with ; or && breaks because pkill exits 144.
 ```bash
-pkill -f unified_dashboard; sleep 2
+pkill -f unified_dashboard
+```
+Wait for it to die, then:
+```bash
 XSECT_GRIB_BACKEND=auto WXSECTION_KEY=cwtc nohup python3 tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs > /tmp/dashboard.log 2>&1 &
 ```
 
