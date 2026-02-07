@@ -108,7 +108,12 @@ Returns the list of available atmospheric products.
     {"id": "wetbulb", "name": "Wet-Bulb Temperature", "units": "\u00b0C"},
     {"id": "icing", "name": "Icing Potential", "units": "g/kg"},
     {"id": "frontogenesis", "name": "Frontogenesis", "units": "K/100km/3hr"},
-    {"id": "smoke", "name": "PM2.5 Smoke", "units": "\u03bcg/m\u00b3"}
+    {"id": "smoke", "name": "PM2.5 Smoke", "units": "\u03bcg/m\u00b3"},
+    {"id": "vpd", "name": "Vapor Pressure Deficit", "units": "hPa"},
+    {"id": "dewpoint_dep", "name": "Dewpoint Depression", "units": "\u00b0C"},
+    {"id": "moisture_transport", "name": "Moisture Transport", "units": "g\u00b7m/kg/s"},
+    {"id": "pv", "name": "Potential Vorticity", "units": "PVU"},
+    {"id": "fire_wx", "name": "Fire Weather", "units": "composite"}
   ]
 }
 ```
@@ -179,11 +184,16 @@ Health check and basic server info.
 | `vorticity` | Absolute vorticity (rotation) |
 | `shear` | Wind shear (change in wind with height) |
 | `lapse_rate` | Temperature lapse rate (stability) |
-| `cloud_total` | Total cloud condensate |
+| `cloud_total` | Total condensate (cloud + rain + snow + graupel) |
 | `wetbulb` | Wet-bulb temperature with critical 0C line |
 | `icing` | Icing potential (supercooled liquid water) |
 | `frontogenesis` | Frontogenesis (frontal zone strengthening) |
 | `smoke` | PM2.5 smoke concentration (HRRR-Smoke) |
+| `vpd` | Vapor pressure deficit |
+| `dewpoint_dep` | Dewpoint depression (T minus Td) |
+| `moisture_transport` | Moisture transport (q x wind speed) |
+| `pv` | Potential vorticity |
+| `fire_wx` | Fire weather composite (VPD + wind + RH) |
 
 All products include terrain shading, wind barbs, theta contours, and the 0C freezing level.
 

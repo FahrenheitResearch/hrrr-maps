@@ -35,7 +35,7 @@ XSECT_GRIB_BACKEND=auto WXSECTION_KEY=your_key python tools/unified_dashboard.py
 ### Interactive Web Dashboard
 - **Leaflet map** (OpenTopoMap) with click-to-place markers and draggable endpoints
 - **Multi-model support**: HRRR (3km), GFS (0.25deg), RRFS (3km) with model selector dropdown
-- **19 visualization styles** via dropdown with community voting
+- **20 visualization styles** via dropdown with community voting
 - **Up to 48 forecast hours** with color-coded chip system (synoptic HRRR cycles: F00-F48, others: F00-F18):
   - **Grey** = on disk, not opened (click to open via mmap, ~14ms if cached)
   - **Green** = opened (mmap handles ready, click for instant view)
@@ -75,12 +75,12 @@ XSECT_GRIB_BACKEND=auto WXSECTION_KEY=your_key python tools/unified_dashboard.py
 - **Configurable workers** - `--grib-workers N` / `--preload-workers N` (or env `XSECT_GRIB_WORKERS` / `XSECT_PRELOAD_WORKERS`)
 
 ### Mmap Cache Architecture
-- **Memory-mapped cache on NVMe** - per-field raw arrays, ~2.3GB per FHR on disk
+- **Memory-mapped cache on NVMe** - per-field raw arrays, ~2.8GB per FHR on disk
 - **Tiny RAM footprint** - mmap only pages in accessed slices (~100MB resident per FHR, ~29MB heap)
-- **~125 FHRs in preload window** = ~290GB on NVMe, ~12GB in RAM
+- **~125 FHRs in preload window** = ~350GB on NVMe, ~12GB in RAM
 - **Two-tier NVMe eviction**:
   - Tier 1: Rotated preload cycles always evicted from cache when they leave target window
-  - Tier 2: Archive request caches persist up to 670GB limit, oldest evicted first when over
+  - Tier 2: Archive request caches persist up to 1TB limit, oldest evicted first when over
 - **Per-model memory budgets**: HRRR 48GB, GFS 8GB, RRFS 8GB
 
 ### Auto-Update (Slot-Based Concurrent)
@@ -101,9 +101,9 @@ XSECT_GRIB_BACKEND=auto WXSECTION_KEY=your_key python tools/unified_dashboard.py
 
 ### Disk Storage
 - **GRIB sources on VHD** (`/mnt/hrrr/`) - 20TB external VHDX, 500GB GRIB limit with LRU eviction
-- **Mmap cache on NVMe** (`cache/xsect/{model}/`) - ~400GB preload + ~245GB archive headroom
+- **Mmap cache on NVMe** (`cache/xsect/{model}/`) - ~500GB preload + ~500GB archive headroom
 - **GRIB disk limit** of 500GB with popularity-based eviction
-- **NVMe cache limit** of 670GB with two-tier eviction
+- **NVMe cache limit** of 1TB with two-tier eviction
 
 ## Visualization Styles
 
@@ -122,7 +122,7 @@ XSECT_GRIB_BACKEND=auto WXSECTION_KEY=your_key python tools/unified_dashboard.py
 | `rh` | Relative humidity (%) | Dry slots, moisture plumes |
 | `q` | Specific humidity (g/kg) | Moisture transport |
 | `cloud` | Cloud water (g/kg) | Cloud layers |
-| `cloud_total` | All hydrometeors | Full precipitation picture |
+| `cloud_total` | All hydrometeors (cloud + rain + snow + graupel) | Full condensate picture |
 
 ### Smoke & Air Quality
 | Style | Shows | Use For |

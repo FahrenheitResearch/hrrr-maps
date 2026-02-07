@@ -45,7 +45,7 @@ REQUESTS_FILE = Path(__file__).parent.parent / 'data' / 'requests.json'
 FAVORITES_FILE = Path(__file__).parent.parent / 'data' / 'favorites.json'
 DISK_META_FILE = Path(__file__).parent.parent / 'data' / 'disk_meta.json'
 DISK_LIMIT_GB = 500  # Max disk usage for HRRR data (GRIB source on VHD)
-CACHE_LIMIT_GB = 670  # Max NVMe cache (~425GB preload + ~245GB for archive requests)
+CACHE_LIMIT_GB = 1000  # Max NVMe cache (~1TB)
 CLIMATOLOGY_DIR = Path('/mnt/hrrr/climatology')
 
 # Styles that support anomaly mode (must match ANOMALY_STYLES in cross_section_interactive.py)
@@ -74,6 +74,7 @@ PRODUCT_TO_STYLE = {
     'dewpoint_dep': 'dewpoint_dep', 'dewpoint_depression': 'dewpoint_dep',
     'moisture_transport': 'moisture_transport',
     'pv': 'pv', 'potential_vorticity': 'pv',
+    'fire_wx': 'fire_wx', 'fire_weather': 'fire_wx',
 }
 PRODUCTS_INFO = [
     {'id': 'temperature', 'name': 'Temperature', 'units': '\u00b0C'},
@@ -94,6 +95,7 @@ PRODUCTS_INFO = [
     {'id': 'dewpoint_dep', 'name': 'Dewpoint Depression', 'units': '\u00b0C'},
     {'id': 'moisture_transport', 'name': 'Moisture Transport', 'units': 'g\u00b7m/kg/s'},
     {'id': 'pv', 'name': 'Potential Vorticity', 'units': 'PVU'},
+    {'id': 'fire_wx', 'name': 'Fire Weather Composite', 'units': 'RH% + wind'},
 ]
 
 def load_votes():
@@ -405,6 +407,7 @@ XSECT_STYLES = [
     ('dewpoint_dep', 'Dewpoint Depression'),
     ('moisture_transport', 'Moisture Transport'),
     ('pv', 'Potential Vorticity'),
+    ('fire_wx', '🔥 Fire Weather'),
 ]
 
 # =============================================================================
@@ -2256,34 +2259,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             font-family: monospace;
         }
 
-        /* Voting */
-        .vote-buttons {
-            display: flex;
-            gap: 4px;
-            align-items: center;
-        }
-        .vote-btn {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            color: var(--muted);
-            padding: 4px 10px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-            display: flex;
-            align-items: center;
-            gap: 4px;
-            transition: all 0.15s;
-        }
-        .vote-btn:hover { border-color: var(--accent); color: var(--text); background: var(--bg); }
-        .vote-btn.voted-up { background: #22c55e33; border-color: #22c55e; color: #22c55e; }
-        .vote-btn.voted-down { background: #ef444433; border-color: #ef4444; color: #ef4444; }
-        .vote-count { font-size: 12px; min-width: 20px; text-align: center; }
-
-        .help-btn, .request-btn {
+        .request-btn {
             background: var(--card);
             border: 1px solid var(--border);
-            color: var(--accent);
+            color: var(--warning);
             width: 28px;
             height: 28px;
             border-radius: 50%;
@@ -2294,9 +2273,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             align-items: center;
             justify-content: center;
         }
-        .help-btn:hover, .request-btn:hover { background: var(--accent); color: #000; }
-        .request-btn { color: var(--warning); }
-        .request-btn:hover { background: var(--warning); }
+        .request-btn:hover { background: var(--warning); color: #000; }
 
         /* Request Modal */
         #request-modal {
@@ -2435,7 +2412,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 </div>
                 <div class="control-group favorites-group">
                     <select id="favorites-select">
-                        <option value="">Favorites</option>
+                        <option value="">Presets & Favorites</option>
                     </select>
                     <button id="save-favorite-btn" title="Save current view" style="padding:3px 6px;font-size:12px;">Save</button>
                 </div>
@@ -2484,7 +2461,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <option value="mi">mi</option>
                     </select>
                 </div>
-                <button class="help-btn" id="help-btn" title="Style explanations & feedback">?</button>
+                <button id="help-btn" title="Style guide & legend" style="padding:3px 8px;font-size:12px;">Guide</button>
                 <button id="request-cycle-btn" title="Request a specific init cycle" style="padding:3px 8px;font-size:12px;">Request Run</button>
                 <button id="gif-btn" title="Generate animated GIF" style="padding:3px 8px;font-size:12px;">GIF</button>
                 <select id="gif-speed" title="GIF speed" style="min-width:55px;">
@@ -2568,7 +2545,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <div id="explainer-modal">
         <div class="modal-content">
             <div class="modal-header">
-                <h2>Cross-Section Styles - Help & Feedback</h2>
+                <h2>Style Guide</h2>
                 <button class="modal-close" id="modal-close">&times;</button>
             </div>
             <div class="modal-body" id="modal-body">
@@ -2905,18 +2882,42 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         const favoritesSelect = document.getElementById('favorites-select');
         const saveFavoriteBtn = document.getElementById('save-favorite-btn');
 
+        const CA_PRESETS = [
+            { name: 'Sierra Crest', config: { start_lat: 37.0, start_lon: -121.0, end_lat: 37.0, end_lon: -118.0 }},
+            { name: 'LA Basin \u2192 San Gabriels', config: { start_lat: 33.95, start_lon: -118.4, end_lat: 34.35, end_lon: -117.6 }},
+            { name: 'Diablo Wind Corridor', config: { start_lat: 37.85, start_lon: -122.5, end_lat: 37.85, end_lon: -121.5 }},
+            { name: 'Central Valley N\u2192S', config: { start_lat: 40.5, start_lon: -122.0, end_lat: 35.0, end_lon: -119.0 }},
+            { name: 'SoCal Offshore Flow', config: { start_lat: 34.1, start_lon: -119.5, end_lat: 34.1, end_lon: -117.0 }},
+        ];
+
         async function loadFavorites() {
             try {
                 const res = await fetch('/api/favorites');
                 const favorites = await res.json();
-                favoritesSelect.innerHTML = '<option value="">⭐ Favorites (' + favorites.length + ')</option>';
-                favorites.forEach(fav => {
+                favoritesSelect.innerHTML = '<option value="">Presets & Favorites</option>';
+                // CA Presets group
+                const presetGroup = document.createElement('optgroup');
+                presetGroup.label = 'CA Presets';
+                CA_PRESETS.forEach(p => {
                     const opt = document.createElement('option');
-                    opt.value = JSON.stringify(fav);
-                    opt.textContent = fav.name + (fav.label ? ' - ' + fav.label.substring(0, 30) : '');
-                    opt.title = fav.label || fav.name;
-                    favoritesSelect.appendChild(opt);
+                    opt.value = JSON.stringify(p);
+                    opt.textContent = p.name;
+                    presetGroup.appendChild(opt);
                 });
+                favoritesSelect.appendChild(presetGroup);
+                // User favorites group
+                if (favorites.length > 0) {
+                    const favGroup = document.createElement('optgroup');
+                    favGroup.label = 'Saved (' + favorites.length + ')';
+                    favorites.forEach(fav => {
+                        const opt = document.createElement('option');
+                        opt.value = JSON.stringify(fav);
+                        opt.textContent = fav.name + (fav.label ? ' - ' + fav.label.substring(0, 30) : '');
+                        opt.title = fav.label || fav.name;
+                        favGroup.appendChild(opt);
+                    });
+                    favoritesSelect.appendChild(favGroup);
+                }
             } catch (e) {
                 console.error('Failed to load favorites:', e);
             }
@@ -2977,7 +2978,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 if (cfg.y_top) document.getElementById('ytop-select').value = cfg.y_top;
                 this.value = '';  // Reset dropdown
                 generateCrossSection();
-                showToast('Loaded: ' + fav.name);
+                showToast('Loaded: ' + fav.name, 'success');
             } catch (e) {
                 console.error('Failed to apply favorite:', e);
             }
@@ -4167,136 +4168,56 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }, 5 * 60 * 1000);  // Every 5 minutes
 
         // =========================================================================
-        // Explainer Modal & Voting
+        // Style Guide
         // =========================================================================
-        const styleExplanations = {
-            wind_speed: {
-                name: 'Wind Speed',
-                desc: 'Shows horizontal wind speed in knots. Useful for identifying jet streams, low-level jets, and wind maxima. Wind barbs show true eastward wind component.',
-                tech: 'wind_speed = sqrt(u² + v²) × 1.944 kt/m/s'
-            },
-            temp: {
-                name: 'Temperature',
-                desc: 'Temperature in Celsius with isotherms. Identifies inversions, frontal zones, and the freezing level. Cyan lines show key isotherms (-10°C, -20°C, -30°C).',
-                tech: 'temp_c = T - 273.15'
-            },
-            theta_e: {
-                name: 'Equivalent Potential Temperature (θe)',
-                desc: 'Conservative tracer for moist air parcels. Useful for identifying warm/cold advection, atmospheric rivers, and instability. Higher values = warmer, moister air.',
-                tech: 'θe = θ × exp(Lv × r / (cp × T))'
-            },
-            rh: {
-                name: 'Relative Humidity',
-                desc: 'Percentage saturation of air. Brown = dry air (dry slots, subsidence), Green = moist air. Useful for identifying moisture plumes and dry intrusions.',
-                tech: 'RH directly from model output (%)'
-            },
-            q: {
-                name: 'Specific Humidity',
-                desc: 'Absolute moisture content in g/kg. Unlike RH, this is not temperature-dependent. Useful for tracking moisture transport and atmospheric rivers.',
-                tech: 'q in g/kg, with RH contours at 70%, 80%, 90%'
-            },
-            omega: {
-                name: 'Vertical Velocity (ω)',
-                desc: 'Vertical motion in pressure coordinates. Blue = rising air (convection, frontal lift), Red = sinking air (subsidence). Key for precipitation and cloud formation.',
-                tech: 'ω in Pa/s, converted to hPa/hr. Negative = rising.'
-            },
-            vorticity: {
-                name: 'Absolute Vorticity',
-                desc: 'Spin of the atmosphere. Red = cyclonic (counterclockwise NH), Blue = anticyclonic. Vorticity maxima often associated with troughs and storm development.',
-                tech: 'ζ_abs = ζ_rel + f, units: 10⁻⁵ s⁻¹'
-            },
-            shear: {
-                name: 'Wind Shear',
-                desc: 'Rate of change of wind with height. High shear indicates jet cores and potential turbulence zones. Important for aviation and severe weather.',
-                tech: 'shear = |dV/dz|, units: 10⁻³ s⁻¹'
-            },
-            lapse_rate: {
-                name: 'Temperature Lapse Rate',
-                desc: 'Rate of temperature decrease with height. Values near 9.8°C/km (dry adiabatic) indicate instability. Values < 6°C/km indicate stability. Reference lines show dry and moist adiabatic rates.',
-                tech: 'Γ = -dT/dz, units: °C/km'
-            },
-            cloud: {
-                name: 'Cloud Water',
-                desc: 'Cloud liquid water content. Shows cloud layer locations and thickness. Higher values indicate denser clouds with more precipitation potential.',
-                tech: 'Cloud water mixing ratio (g/kg)'
-            },
-            cloud_total: {
-                name: 'Total Condensate',
-                desc: 'Sum of all hydrometeors: cloud water, rain, snow, ice, graupel. Gives complete picture of where precipitation and clouds exist in the atmosphere.',
-                tech: 'Total = cloud + rain + snow + ice + graupel (g/kg)'
-            },
-            wetbulb: {
-                name: 'Wet-Bulb Temperature',
-                desc: 'Temperature if air were cooled to saturation by evaporation. Critical for precipitation type: above 0°C = rain, below 0°C = snow. Lime line shows wet-bulb 0°C.',
-                tech: 'Tw computed via iterative psychrometric formula'
-            },
-            icing: {
-                name: 'Icing Potential',
-                desc: 'Supercooled liquid water proxy for aircraft icing. Shows where liquid water exists at subfreezing temperatures (0°C to -20°C). Purple = higher icing risk.',
-                tech: 'Icing = cloud_water where -20°C < T < 0°C'
-            },
-            frontogenesis: {
-                name: 'Frontogenesis (Winter Bander)',
-                desc: 'Petterssen kinematic frontogenesis - the key diagnostic for mesoscale snow bands. Red = frontogenesis (temperature gradient intensifying, banding likely). Blue = frontolysis.',
-                tech: 'F = -|∇θ|⁻¹ × (deformation terms), K/100km/3hr, σ=1.5 smoothing'
-            }
-        };
-
-        let currentVotes = {};
-
-        async function loadVotes() {
-            try {
-                const res = await fetch('/api/votes');
-                currentVotes = await res.json();
-            } catch (e) {
-                currentVotes = {};
-            }
-        }
-
-        async function submitVote(style, vote) {
-            try {
-                const res = await fetch('/api/vote', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({style, vote})
-                });
-                const data = await res.json();
-                currentVotes[style] = data;
-                renderExplainerModal();
-            } catch (e) {
-                showToast('Failed to submit vote', 'error');
-            }
-        }
+        const styleGuide = [
+            { category: 'Temperature & Moisture', styles: [
+                { key: 'temp', name: 'Temperature', desc: 'Temperature in \u00b0C. Identify inversions, frontal zones, and freezing level. Cyan isotherms at -10/-20\u00b0C, light blue DGZ band (-12 to -18\u00b0C) for snow growth.', overlays: 'Freezing level (magenta), isotherms, DGZ band, snow level' },
+                { key: 'wetbulb', name: 'Wet-Bulb Temperature', desc: 'Wet-bulb temperature \u2014 accounts for evaporative cooling. The 0\u00b0C line (lime) is the rain/snow boundary. More accurate than dry-bulb for precipitation type.', overlays: '0\u00b0C wet-bulb snow line (lime)' },
+                { key: 'rh', name: 'Relative Humidity', desc: 'Relative humidity. Brown = dry air (subsidence, dry slots), green = moist. Track moisture plumes and dry intrusions aloft.', overlays: 'Snow level' },
+                { key: 'q', name: 'Specific Humidity', desc: 'Specific humidity \u2014 absolute moisture in g/kg. Unlike RH, not temperature-dependent. Best for tracking moisture transport and atmospheric rivers.', overlays: 'RH contours at 70/80/90%' },
+                { key: 'theta_e', name: 'Theta-E', desc: 'Equivalent potential temperature \u2014 conserved in moist processes. Higher values = warmer, moister air. Identifies warm/cold advection, instability, and atmospheric river cores.', overlays: 'Snow level' },
+                { key: 'dewpoint_dep', name: 'Dewpoint Depression', desc: 'Dewpoint depression (T \u2212 Td). Near-zero = saturated air (clouds/fog). Large values = very dry. Useful for identifying cloud layers and dry air entrainment.' },
+                { key: 'vpd', name: 'Vapor Pressure Deficit', desc: 'Vapor pressure deficit \u2014 how much more moisture the air can hold. High VPD drives evapotranspiration and fuels wildfire spread. Critical for fire weather and agriculture.' },
+            ]},
+            { category: 'Wind & Dynamics', styles: [
+                { key: 'wind_speed', name: 'Wind Speed', desc: 'Wind speed in knots with wind barbs showing direction. Identify jet streams, low-level jets, gap winds, and mountain wave amplification.' },
+                { key: 'omega', name: 'Vertical Velocity', desc: 'Vertical velocity in hPa/hr. Blue = rising (frontal lift, convection), red = sinking (subsidence). Key for precipitation and cloud formation.', overlays: 'Snow level' },
+                { key: 'vorticity', name: 'Absolute Vorticity', desc: 'Absolute vorticity \u2014 atmospheric spin. Red = cyclonic (counterclockwise in NH). Maxima mark troughs and areas of storm development.' },
+                { key: 'shear', name: 'Wind Shear', desc: 'Wind shear \u2014 rate of wind change with height. High values indicate jet cores, turbulence zones, and severe weather potential.' },
+                { key: 'moisture_transport', name: 'Moisture Transport', desc: 'Moisture flux (q \u00d7 wind speed). Highlights atmospheric rivers and moisture conveyor belts. Higher values = stronger moisture transport.', overlays: 'Snow level' },
+                { key: 'pv', name: 'Potential Vorticity', desc: 'Potential vorticity. The 2 PVU surface (magenta) marks the dynamical tropopause. Stratospheric intrusions appear as high-PV tongues descending into the troposphere.' },
+            ]},
+            { category: 'Clouds & Precip', styles: [
+                { key: 'cloud', name: 'Cloud Water', desc: 'Cloud liquid water content. Shows cloud layer locations, thickness, and density.' },
+                { key: 'cloud_total', name: 'Total Condensate', desc: 'All hydrometeors combined: cloud water, rain, snow, ice, graupel. Complete picture of where precipitation exists.' },
+                { key: 'icing', name: 'Icing Potential', desc: 'Supercooled liquid water where T is 0 to -20\u00b0C. Purple = higher aircraft icing risk. Key for aviation safety.' },
+                { key: 'lapse_rate', name: 'Lapse Rate', desc: 'Temperature change with height (\u00b0C/km). Near 9.8 = dry adiabatic (very unstable). Below 6 = stable. Reference lines show dry and moist adiabatic rates.' },
+                { key: 'frontogenesis', name: 'Frontogenesis', desc: 'Petterssen frontogenesis \u2014 the key diagnostic for mesoscale snow bands. Red = temperature gradients intensifying (banding likely). Blue = frontolysis.' },
+            ]},
+            { category: 'Hazards & Composites', styles: [
+                { key: 'fire_wx', name: 'Fire Weather', desc: 'Fire weather composite. RH fill (red=dry, green=moist) with Red Flag thresholds: 15% RH (red dashed), 25% RH (orange dashed), 25 kt wind (black). Cross-hatched zones meet both criteria simultaneously.', overlays: 'RH 15% (red), 25% (orange), wind 25kt (black), critical zone hatching, snow level' },
+                { key: 'smoke', name: 'PM2.5 Smoke', desc: 'PM2.5 smoke concentration on native hybrid model levels. Shows smoke plume altitude and density. Only available when HRRR wrfnat files are loaded.' },
+            ]},
+        ];
 
         function renderExplainerModal() {
             const body = document.getElementById('modal-body');
-            body.innerHTML = Object.entries(styleExplanations).map(([key, info]) => {
-                const votes = currentVotes[key] || {up: 0, down: 0};
-                const net = votes.up - votes.down;
-                const netColor = net > 0 ? '#22c55e' : (net < 0 ? '#ef4444' : 'var(--muted)');
-                return `
-                    <div class="param-card">
-                        <div class="param-header">
-                            <span class="param-name">${info.name}</span>
-                            <div class="vote-buttons">
-                                <button class="vote-btn" onclick="submitVote('${key}', 'up')" title="Good implementation">
-                                    👍 <span class="vote-count">${votes.up}</span>
-                                </button>
-                                <button class="vote-btn" onclick="submitVote('${key}', 'down')" title="Needs improvement">
-                                    👎 <span class="vote-count">${votes.down}</span>
-                                </button>
-                                <span class="vote-count" style="color:${netColor};margin-left:4px">${net >= 0 ? '+' : ''}${net}</span>
-                            </div>
+            body.innerHTML = styleGuide.map(group => `
+                <div style="margin-bottom:16px;">
+                    <h3 style="color:var(--accent);font-size:14px;margin:12px 0 8px;text-transform:uppercase;letter-spacing:1px;">${group.category}</h3>
+                    ${group.styles.map(s => `
+                        <div class="param-card" style="cursor:pointer" onclick="document.getElementById('style-select').value='${s.key}';document.getElementById('explainer-modal').classList.remove('visible');generateCrossSection();">
+                            <div class="param-header"><span class="param-name">${s.name}</span></div>
+                            <div class="param-desc">${s.desc}</div>
+                            ${s.overlays ? '<div class="param-tech">Overlays: ' + s.overlays + '</div>' : ''}
                         </div>
-                        <div class="param-desc">${info.desc}</div>
-                        <div class="param-tech">${info.tech}</div>
-                    </div>
-                `;
-            }).join('');
+                    `).join('')}
+                </div>
+            `).join('');
         }
 
-        document.getElementById('help-btn').onclick = async () => {
-            await loadVotes();
+        document.getElementById('help-btn').onclick = () => {
             renderExplainerModal();
             document.getElementById('explainer-modal').classList.add('visible');
         };

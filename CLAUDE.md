@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Multi-model atmospheric cross-section generator. Users draw a line on a map, get an instant vertical cross-section from HRRR, GFS, or RRFS weather model data. Live at **wxsection.com**. 19 visualization styles, all derived from cached fields.
+Multi-model atmospheric cross-section generator. Users draw a line on a map, get an instant vertical cross-section from HRRR, GFS, or RRFS weather model data. Live at **wxsection.com**. 20 visualization styles, all derived from cached fields.
 
 ## Architecture Summary
 
@@ -17,14 +17,14 @@ start.sh                      — Production startup (mount VHD, start services,
 
 ## Key Design Decisions
 
-- **Mmap cache on NVMe**: GRIB files are converted to raw numpy arrays (2.3GB/FHR on disk, ~100MB resident RAM). This is what makes instant cross-sections possible.
+- **Mmap cache on NVMe**: GRIB files are converted to raw numpy arrays (~2.8GB/FHR on disk, ~100MB resident RAM). This is what makes instant cross-sections possible.
 - **eccodes `auto` backend**: Default GRIB backend tries eccodes direct (one-pass scan, ~35% faster), falls back to cfgrib. Configurable via `XSECT_GRIB_BACKEND` env var.
 - **Lazy smoke loading**: wrfnat files (652MB, 50 hybrid levels) loaded on-demand on first `smoke` style request, not during preload. `ForecastHourData.grib_file` stores source path for deferred resolution.
 - **Single-process, threaded**: WSL2 folio contention breaks ProcessPoolExecutor. Everything runs in one process with ThreadPoolExecutor.
 - **Slot-based concurrent auto-update**: 3 HRRR + 1 GFS + 1 RRFS download slots in parallel via ThreadPoolExecutor. Each model has its own lane — slow RRFS can't block HRRR. HRRR fail-fast prunes unavailable FHRs.
 - **Status file IPC**: auto_update.py writes `/tmp/auto_update_status.json` atomically; dashboard reads it to show download progress in the activity panel. No shared memory or sockets.
 - **No handoff cycles**: Only one synoptic (48h) HRRR cycle, only one GFS/RRFS cycle. Previous cycles are evicted.
-- **Two-tier NVMe eviction**: Rotated preload cycles always evicted. Archive request caches persist up to 670GB.
+- **Two-tier NVMe eviction**: Rotated preload cycles always evicted. Archive request caches persist up to 1TB.
 
 ## Running Locally
 
@@ -64,7 +64,7 @@ Logs: `/tmp/dashboard.log`, `/tmp/auto_update.log`, `/tmp/cloudflared.log`
 1. **GRIB conversion is GIL-bound**: eccodes/cfgrib can't parallelize beyond 3-4 threads. Don't try ProcessPoolExecutor — folio contention on WSL2.
 2. **matplotlib OO API required**: Uses `Figure()` + `fig.add_subplot()` (not `plt.subplots()`) to avoid pyplot global state races under ThreadPoolExecutor. All colorbar/savefig calls go through `fig.` not `plt.`.
 3. **Memory budget**: HRRR 48GB, GFS 8GB, RRFS 8GB. Mmap keeps resident small but monitor with `/api/status`.
-4. **NVMe space**: 670GB cache limit enforced by `cache_evict_old_cycles()`. Monitor with `df -h /`.
+4. **NVMe space**: 1TB cache limit enforced by `cache_evict_old_cycles()`. Monitor with `df -h /`.
 5. **VHD must be mounted**: `/mnt/hrrr` needs `sudo mount /dev/sde /mnt/hrrr` after every WSL restart.
 6. **Smoke loading is lazy**: wrfnat (652MB, 50 hybrid levels) only loaded on first `style=smoke` request, not during preload. Saves ~100s on startup.
 
@@ -76,7 +76,7 @@ RENDER_SEMAPHORE = 12      # Max concurrent matplotlib renders
 PRERENDER_WORKERS = 8      # Parallel prerender threads
 PRELOAD_WORKERS = 20       # Cached mmap load threads (--preload-workers / XSECT_PRELOAD_WORKERS)
 GRIB_WORKERS = 4           # GRIB conversion threads (--grib-workers / XSECT_GRIB_WORKERS)
-CACHE_LIMIT_GB = 670       # NVMe cache size limit
+CACHE_LIMIT_GB = 1000      # NVMe cache size limit (~1TB)
 HRRR_HOURLY_CYCLES = 3     # Non-synoptic cycles in preload window
 GRIB_BACKEND = 'auto'      # XSECT_GRIB_BACKEND: auto (eccodes→cfgrib fallback), eccodes, cfgrib
 

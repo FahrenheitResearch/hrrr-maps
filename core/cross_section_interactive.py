@@ -51,6 +51,10 @@ class ForecastHourData:
     vorticity: np.ndarray = None  # 1/s
     cloud: np.ndarray = None  # kg/kg
     dew_point: np.ndarray = None  # K
+    ice: np.ndarray = None  # kg/kg - ice water mixing ratio
+    rain: np.ndarray = None  # kg/kg - rain water mixing ratio
+    snow: np.ndarray = None  # kg/kg - snow mixing ratio
+    graupel: np.ndarray = None  # kg/kg - graupel mixing ratio
 
     # Smoke on native hybrid levels (NOT isobaric) — preserves boundary layer detail
     smoke_hyb: np.ndarray = None  # (n_hyb, ny, nx) μg/m³ PM2.5 on hybrid levels
@@ -131,6 +135,7 @@ def _load_hour_process(
         'u': 'u_wind', 'v': 'v_wind', 'r': 'rh', 'w': 'omega',
         'q': 'specific_humidity', 'gh': 'geopotential_height',
         'absv': 'vorticity', 'clwmr': 'cloud', 'dpt': 'dew_point',
+        'icmr': 'ice', 'rwmr': 'rain', 'snmr': 'snow', 'grle': 'graupel',
     }
 
     backend = (grib_backend or 'cfgrib').strip().lower()
@@ -431,7 +436,7 @@ class InteractiveCrossSection:
         }
         return cls._cartopy_features_cache
 
-    # Fields to pre-load (covers all 13 styles)
+    # Fields to pre-load (covers all styles including hydrometeors)
     FIELDS_TO_LOAD = {
         't': 'temperature',
         'u': 'u_wind',
@@ -443,9 +448,13 @@ class InteractiveCrossSection:
         'absv': 'vorticity',
         'clwmr': 'cloud',
         'dpt': 'dew_point',
+        'icmr': 'ice',
+        'rwmr': 'rain',
+        'snmr': 'snow',
+        'grle': 'graupel',
     }
 
-    CACHE_LIMIT_GB = 400  # Max NPZ cache size on disk
+    CACHE_LIMIT_GB = 1000  # Max cache size on disk
 
     SUPPORTED_GRIB_BACKENDS = {'cfgrib', 'eccodes', 'auto'}
 
@@ -628,6 +637,7 @@ class InteractiveCrossSection:
     _FLOAT16_FIELDS = {
         'temperature', 'u_wind', 'v_wind', 'rh', 'omega',
         'specific_humidity', 'vorticity', 'cloud', 'dew_point',
+        'ice', 'rain', 'snow', 'graupel',
         'surface_pressure', 'theta', 'temp_c',
         'smoke_hyb', 'smoke_pres_hyb',
     }
@@ -1968,6 +1978,12 @@ class InteractiveCrossSection:
         if style in ['cloud', 'cloud_total', 'icing'] and fhr_data.cloud is not None:
             result['cloud'] = interp_3d(fhr_data.cloud)
 
+        if style == 'cloud_total':
+            for hydro_key in ['ice', 'rain', 'snow', 'graupel']:
+                arr = getattr(fhr_data, hydro_key, None)
+                if arr is not None:
+                    result[hydro_key] = interp_3d(arr)
+
         if style == 'theta_e' and fhr_data.specific_humidity is not None:
             q = interp_3d(fhr_data.specific_humidity)
             result['specific_humidity'] = q
@@ -2071,6 +2087,24 @@ class InteractiveCrossSection:
             g = 9.81
             pv = -g * vort * dtheta_dp  # K m² kg⁻¹ s⁻¹
             result['pv'] = pv * 1e6  # Convert to PVU
+
+        if style == 'fire_wx' and fhr_data.rh is not None:
+            RH = interp_3d(fhr_data.rh)
+            result['rh'] = RH
+            result['fire_wx'] = RH  # Primary field for level filtering
+
+        # Snow level overlay: compute wet-bulb for selected styles
+        if style in ('temp', 'rh', 'theta_e', 'omega', 'moisture_transport', 'fire_wx') and fhr_data.rh is not None:
+            if 'rh' not in result:
+                result['rh'] = interp_3d(fhr_data.rh)
+            RH_wb = result['rh']
+            T_c_wb = result['temp_c']
+            Tw_overlay = (T_c_wb * np.arctan(0.151977 * np.sqrt(RH_wb + 8.313659))
+                          + np.arctan(T_c_wb + RH_wb)
+                          - np.arctan(RH_wb - 1.676331)
+                          + 0.00391838 * (RH_wb ** 1.5) * np.arctan(0.023101 * RH_wb)
+                          - 4.686035)
+            result['wetbulb_overlay'] = Tw_overlay
 
         if style == 'frontogenesis':
             # Petterssen Kinematic Frontogenesis (Winter Bander Mode)
@@ -2364,7 +2398,9 @@ class InteractiveCrossSection:
         for key in ['rh', 'omega', 'vorticity', 'cloud', 'temperature', 'temp_c',
                     'specific_humidity', 'theta_e', 'shear', 'dew_point', 'frontogenesis',
                     'icing', 'wetbulb', 'lapse_rate',
-                    'vpd', 'dewpoint_dep', 'moisture_transport', 'pv']:
+                    'vpd', 'dewpoint_dep', 'moisture_transport', 'pv',
+                    'fire_wx', 'wetbulb_overlay',
+                    'ice', 'rain', 'snow', 'graupel']:
             if key in data and data[key] is not None and data[key].ndim == 2:
                 data[key] = filter_levels(data[key])
 
@@ -2515,7 +2551,13 @@ class InteractiveCrossSection:
         elif style == "cloud_total":
             cloud = data.get('cloud')
             if cloud is not None:
-                cloud_gkg = cloud * 1000  # kg/kg to g/kg
+                # Sum all available hydrometeors for true total condensate
+                total = cloud.copy()
+                for hkey in ['ice', 'rain', 'snow', 'graupel']:
+                    h = data.get(hkey)
+                    if h is not None:
+                        total = total + h
+                total_gkg = total * 1000  # kg/kg to g/kg
                 # Cloud colormap: clear sky to dense cloud
                 cloud_colors = [
                     '#FFFFFF',  # Clear
@@ -2528,7 +2570,7 @@ class InteractiveCrossSection:
                     '#385898',  # Very dense
                 ]
                 cloud_cmap = mcolors.LinearSegmentedColormap.from_list('cloud', cloud_colors, N=256)
-                cf = ax.contourf(X, Y, cloud_gkg, levels=np.linspace(0, 1.0, 11), cmap=cloud_cmap, extend='max')
+                cf = ax.contourf(X, Y, total_gkg, levels=np.linspace(0, 1.0, 11), cmap=cloud_cmap, extend='max')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
                 cbar = fig.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Total Condensate (g/kg)')
@@ -2738,6 +2780,37 @@ class InteractiveCrossSection:
                 except:
                     pass
                 shading_label = "PV"
+        elif style == "fire_wx":
+            rh = data.get('rh')
+            if rh is not None:
+                fire_colors = ['#8B0000', '#CC0000', '#FF4500', '#FF8C00',
+                               '#FFD700', '#ADFF2F', '#32CD32', '#228B22']
+                fire_cmap = mcolors.LinearSegmentedColormap.from_list('fire_rh', fire_colors, N=256)
+                cf = ax.contourf(X, Y, rh, levels=np.arange(0, 105, 5), cmap=fire_cmap, extend='both')
+                cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
+                cbar = fig.colorbar(cf, cax=cbar_ax)
+                cbar.set_label('Relative Humidity (%)')
+                # Red Flag thresholds
+                try:
+                    ax.contour(X, Y, rh, levels=[15], colors='red', linewidths=2.5, linestyles='--')
+                    ax.contour(X, Y, rh, levels=[25], colors='orange', linewidths=2, linestyles='--')
+                except:
+                    pass
+                # Wind speed threshold (25 kt)
+                if wind_speed is not None:
+                    try:
+                        ax.contour(X, Y, wind_speed, levels=[25], colors='black', linewidths=2.5)
+                    except:
+                        pass
+                    # Cross-hatch critical zone (RH<15% AND wind>25kt)
+                    critical = ((rh < 15) & (wind_speed > 25)).astype(float)
+                    if np.any(critical > 0):
+                        try:
+                            ax.contourf(X, Y, critical, levels=[0.5, 1.5],
+                                       colors='none', hatches=['xxx'], alpha=0)
+                        except:
+                            pass
+                shading_label = "\U0001f525 Fire Wx"
         else:
             # Default to theta shading
             if theta is not None:
@@ -2820,6 +2893,16 @@ class InteractiveCrossSection:
                 linewidth=0.6, pivot='middle',
                 sizes=dict(emptybarb=0.04, spacing=0.12, height=0.35),
             )
+
+        # Snow level overlay (0°C wet-bulb) for selected styles
+        wb_overlay = data.get('wetbulb_overlay')
+        if wb_overlay is not None and style in ('temp', 'rh', 'theta_e', 'omega', 'moisture_transport', 'fire_wx'):
+            wb_plot = np.ma.masked_where(terrain_mask, wb_overlay) if terrain_mask is not None else wb_overlay
+            try:
+                cs_snow = ax.contour(X, Y, wb_plot, levels=[0], colors='lime', linewidths=2.5)
+                ax.clabel(cs_snow, inline=True, fontsize=9, fmt='Snow Lvl', colors='black')
+            except:
+                pass
 
         # Terrain fill - use high-resolution terrain data if available
         if surface_pressure is not None:

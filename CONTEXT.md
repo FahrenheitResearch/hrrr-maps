@@ -53,10 +53,10 @@ Cached preload (176 FHRs across HRRR+GFS+RRFS): ~4s total
 1. Check mmap cache dir → if exists, load in <0.1s (done)
 2. Check legacy .npz cache → if exists, migrate to mmap (rare)
 3. Load from GRIB (the slow path, ~15s with eccodes):
-   a. One-pass eccodes scan for 10 pressure-level fields (t, u, v, r, w, q, gh, absv, clwmr, dpt)
+   a. One-pass eccodes scan for 14 pressure-level fields (t, u, v, r, w, q, gh, absv, clwmr, dpt, icmr, rwmr, snmr, grle)
    b. Second scan for surface pressure
    c. Compute derived fields (theta via vectorized numpy, temp_c)
-   d. Save all fields to mmap cache (14 fields x 40 levels x 1059x1799)
+   d. Save all fields to mmap cache (18 fields x 40 levels x 1059x1799)
    e. Smoke PM2.5 NOT loaded here — deferred to first smoke render request
 ```
 
@@ -115,13 +115,13 @@ NVMe cache eviction — two-tier (cache_evict_old_cycles):
     - Rotated preload cycles: if a cycle falls out of target window and
       wasn't an archive request, its cache is deleted immediately
     - Example: 03z hourly rotates out when 09z appears → 03z cache deleted
-  Tier 2 (size-based, CACHE_LIMIT_GB = 670):
+  Tier 2 (size-based, CACHE_LIMIT_GB = 1000):
     - Archive request caches persist on NVMe for fast re-loading
-    - Only evicted when total cache exceeds 670GB, oldest archive first
-    - Evicts down to 85% (~570GB) to avoid thrashing
+    - Only evicted when total cache exceeds 1TB, oldest archive first
+    - Evicts down to 85% (~850GB) to avoid thrashing
   - ARCHIVE_CACHE_KEYS set tracks which cycles were archive-requested
   - Target/loaded cycles are never evicted at either tier
-  - Budget: ~425GB preload window + ~245GB archive headroom
+  - Budget: ~500GB preload window + ~500GB archive headroom
 ```
 
 ### Auto-Update (Slot-Based Concurrent)
@@ -184,9 +184,9 @@ Fetches /api/status?model=X for each registered model.
 ```
 
 ### Memory Architecture
-- **Mmap cache per FHR**: 2.3GB on disk (40 levels x 1059 x 1799 x 14 float16/32 fields)
+- **Mmap cache per FHR**: ~2.8GB on disk (40 levels x 1059 x 1799 x 18 float16/32 fields)
 - **Resident RAM per FHR**: ~100MB (mmap only pages in accessed slices)
-- **~125 FHRs loaded**: ~4-6GB RAM, ~290GB on disk
+- **~125 FHRs loaded**: ~4-6GB RAM, ~350GB on disk
 - **Heap per FHR**: ~29MB (lats+lons coordinate arrays)
 - **Memory limits**: 48GB HRRR hard cap, 8GB each GFS/RRFS
 
@@ -212,9 +212,9 @@ Fetches /api/status?model=X for each registered model.
 ### Per-FHR Sizes
 ```
 HRRR GRIB source:  ~1.2GB (wrfprs + wrfsfc + wrfnat)
-HRRR mmap cache:   ~2.3GB (14 fields x 40 levels x 1059x1799)
-HRRR cycle (19 FHR): ~23GB GRIB, ~44GB cache
-HRRR synoptic (49 FHR): ~61GB GRIB, ~113GB cache
+HRRR mmap cache:   ~2.8GB (18 fields x 40 levels x 1059x1799)
+HRRR cycle (19 FHR): ~23GB GRIB, ~53GB cache
+HRRR synoptic (49 FHR): ~61GB GRIB, ~137GB cache
 ```
 
 ---
@@ -225,7 +225,7 @@ HRRR synoptic (49 FHR): ~61GB GRIB, ~113GB cache
 - **Dashboard**: `tools/unified_dashboard.py` — Flask + Leaflet (OpenTopoMap), live at wxsection.com:5561
 - **Cross-section engine**: `core/cross_section_interactive.py` — 0.5s warm renders
 - **Multi-model**: HRRR, GFS, RRFS support everywhere
-- **19 styles**: wind_speed, temp, theta_e, rh, q, omega, vorticity, shear, lapse_rate, cloud, cloud_total, wetbulb, icing, frontogenesis, smoke, vpd, dewpoint_dep, moisture_transport, pv
+- **20 styles**: wind_speed, temp, theta_e, rh, q, omega, vorticity, shear, lapse_rate, cloud, cloud_total, wetbulb, icing, frontogenesis, smoke, vpd, dewpoint_dep, moisture_transport, pv, fire_wx
 - **Run picker**: Filtered to preload window + loaded archive cycles only
 - **Archive requests**: Modal with date picker, hour selector, FHR range (admin-gated)
 - **Activity panel**: Real-time progress for all operations (preload, auto-load, download, prerender, auto-update)
@@ -263,7 +263,7 @@ tools/unified_dashboard.py          # Flask dashboard — everything UI + API
 PRELOAD_WORKERS = 20   # Thread workers for cached mmap loads
 GRIB_WORKERS = 4       # Thread workers for GRIB-to-mmap conversion (THE BOTTLENECK)
 CACHE_BASE = '/home/drew/hrrr-maps/cache/xsect'  # NVMe — fast local storage
-CACHE_LIMIT_GB = 670   # ~290GB preload + ~380GB archive headroom
+CACHE_LIMIT_GB = 1000  # ~500GB preload + ~500GB archive headroom
 RENDER_SEMAPHORE = 12  # 8 prerender + 4 live user requests
 PRERENDER_WORKERS = 8  # Parallel threads for batch prerender
 HRRR_HOURLY_CYCLES = 3
