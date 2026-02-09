@@ -1,4 +1,18 @@
 {
+    "20180723_12z": {
+        "name": "Carr Fire Ignition",
+        "category": "fire-ca",
+        "date_local": "2018-07-23",
+        "why": "Carr Fire ignition near Whiskeytown, CA",
+        "notes": "Ignition ~1pm PST; 12z gives 14h buildup through evening spread"
+    },
+    "20181108_00z": {
+        "name": "Camp Fire - Deadliest CA Fire",
+        "category": "fire-ca",
+        "date_local": "2018-11-08",
+        "why": "Camp Fire ignition and destruction of Paradise, CA",
+        "notes": "Morning ignition; 85 dead, town destroyed in hours"
+    },
     "20200817_12z": {
         "name": "CA Lightning Siege - Outbreak",
         "category": "fire-ca",
@@ -124,6 +138,13 @@
         "date_local": "2025-01-07",
         "why": "LA-area Santa Ana outbreak (Palisades/Eaton etc. starting Jan 7-9)",
         "notes": "Peak morning to daytime winds"
+    },
+    "20250107_18z": {
+        "name": "Eaton Fire Onset",
+        "category": "fire-ca",
+        "date_local": "2025-01-07",
+        "why": "Eaton Fire ignition and rapid spread during Santa Ana event",
+        "notes": "Evening ignition; wind-driven growth overnight"
     },
     "20250702_18z": {
         "name": "Madre Fire Explosive Growth",

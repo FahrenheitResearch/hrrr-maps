@@ -8,7 +8,7 @@ import logging
 
 def create_output_structure(model: str, date: str, hour: int) -> Dict[str, Path]:
     """Create organized output directory structure"""
-    base_dir = Path("outputs")
+    base_dir = Path(os.environ.get('XSECT_OUTPUTS_DIR', 'outputs'))
     model_dir = base_dir / model.lower()
     date_dir = model_dir / date
     run_dir = date_dir / f"{hour:02d}z"

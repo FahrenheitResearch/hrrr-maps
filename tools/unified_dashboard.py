@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import io
+import tempfile
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -56,8 +57,8 @@ REQUESTS_FILE = Path(__file__).parent.parent / 'data' / 'requests.json'
 FAVORITES_FILE = Path(__file__).parent.parent / 'data' / 'favorites.json'
 DISK_META_FILE = Path(__file__).parent.parent / 'data' / 'disk_meta.json'
 DISK_LIMIT_GB = 500  # Max disk usage for HRRR data (GRIB source on VHD)
-CACHE_LIMIT_GB = 1000  # Max NVMe cache (~1TB)
-CLIMATOLOGY_DIR = Path('/mnt/hrrr/climatology')
+CACHE_LIMIT_GB = 500   # Max NVMe cache for mmap files
+CLIMATOLOGY_DIR = Path(os.environ.get('CLIMATOLOGY_DIR', str(Path(__file__).resolve().parent.parent / 'climatology')))
 
 # Styles that support anomaly mode (must match ANOMALY_STYLES in cross_section_interactive.py)
 ANOMALY_STYLES = {
@@ -221,7 +222,7 @@ def touch_cycle_access(cycle_key):
 
 def get_disk_usage_gb():
     """Get total disk usage of HRRR data directory in GB."""
-    base = Path("outputs/hrrr")
+    base = Path(os.environ.get('XSECT_OUTPUTS_DIR', 'outputs')) / 'hrrr'
     if not base.exists():
         return 0
     total = sum(f.stat().st_size for f in base.rglob("*") if f.is_file())
@@ -236,7 +237,7 @@ def disk_evict_least_popular(target_gb=None):
     if target_gb is None:
         target_gb = DISK_LIMIT_GB * 0.85  # Evict down to 85% of limit
 
-    base = Path("outputs/hrrr")
+    base = Path(os.environ.get('XSECT_OUTPUTS_DIR', 'outputs')) / 'hrrr'
     if not base.exists():
         return
 
@@ -561,29 +562,45 @@ def progress_cleanup():
 CANCEL_FLAGS = {}  # op_id -> True when cancellation requested
 ARCHIVE_CACHE_KEYS = set()  # cycle keys (YYYYMMDD_HHz) from archive requests — persist on NVMe
 
-def _scan_archive_cache_keys():
-    """Scan mmap cache for cycles outside the recent window and register them as archive keys.
+# eccodes has a cold-start init race: concurrent first-use can crash the definition parser.
+# After one single-threaded warm-up conversion, concurrent GRIB workers are safe.
+_eccodes_warmed = False
+_eccodes_warm_lock = threading.Lock()
 
-    This ensures archive cycles converted by standalone scripts (not via /api/request_cycle)
-    are protected from eviction and appear in the UI dropdown when loaded.
+def _scan_archive_cache_keys():
+    """Scan mmap cache dirs for cycles outside the recent window and register them as archive keys.
+
+    Scans both the main cache (XSECT_CACHE_DIR, NVMe) and the archive cache
+    (XSECT_ARCHIVE_DIR/cache/xsect, D: drive) so that events converted by
+    standalone scripts appear in the UI dropdown.
     """
     from datetime import datetime, timedelta
-    cache_base = Path('/home/drew/hrrr-maps/cache/xsect')
+    cache_base = Path(os.environ.get('XSECT_CACHE_DIR', str(Path(__file__).resolve().parent.parent / 'cache' / 'xsect')))
+    archive_env = os.environ.get('XSECT_ARCHIVE_DIR', '')
+    archive_caches = []
+    for p in archive_env.split(','):
+        p = p.strip()
+        if p:
+            ac = Path(p) / 'cache' / 'xsect'
+            if ac.is_dir():
+                archive_caches.append(ac)
     cutoff = (datetime.utcnow() - timedelta(days=7)).strftime('%Y%m%d')
     seen = set()
-    for model_dir in cache_base.iterdir():
-        if not model_dir.is_dir():
-            continue
-        for entry in model_dir.iterdir():
-            if not entry.is_dir() or not (entry / '_complete').exists():
+    scan_dirs = [cache_base] + archive_caches
+    for cache_dir in scan_dirs:
+        for model_dir in cache_dir.iterdir():
+            if not model_dir.is_dir():
                 continue
-            # Parse cycle key from dir name: YYYYMMDD_HHz_Fxx_filename
-            parts = entry.name.split('_')
-            if len(parts) >= 2 and len(parts[0]) == 8 and parts[0].isdigit():
-                date_str = parts[0]
-                if date_str < cutoff:
-                    ck = f"{parts[0]}_{parts[1]}"
-                    seen.add(ck)
+            for entry in model_dir.iterdir():
+                if not entry.is_dir() or not (entry / '_complete').exists():
+                    continue
+                # Parse cycle key from dir name: YYYYMMDD_HHz_Fxx_filename
+                parts = entry.name.split('_')
+                if len(parts) >= 2 and len(parts[0]) == 8 and parts[0].isdigit():
+                    date_str = parts[0]
+                    if date_str < cutoff:
+                        ck = f"{parts[0]}_{parts[1]}"
+                        seen.add(ck)
     return seen
 
 ARCHIVE_CACHE_KEYS.update(_scan_archive_cache_keys())
@@ -669,14 +686,14 @@ class CrossSectionManager:
 
     PRELOAD_WORKERS = 20  # Thread workers for mmap loads (fast, ~14ms each)
     GRIB_WORKERS = 4      # Workers for GRIB conversion
-    CACHE_BASE = '/home/drew/hrrr-maps/cache/xsect'  # NVMe — faster I/O, no VHD folio contention
+    CACHE_BASE = os.environ.get('XSECT_CACHE_DIR', str(Path(__file__).resolve().parent.parent / 'cache' / 'xsect'))  # NVMe — faster I/O
 
     PRELOAD_CYCLES = 0  # Don't pre-load; load on demand
 
     def __init__(self, model_name: str = 'hrrr', mem_limit_mb: int = 48000, mem_evict_mb: int = 46000):
         self.model_name = model_name
         self.xsect = None
-        self.base_dir = Path(f"outputs/{model_name}")
+        self.base_dir = Path(os.environ.get('XSECT_OUTPUTS_DIR', 'outputs')) / model_name
         self.available_cycles = []  # List of available cycles (metadata only)
         self.loaded_cycles = set()  # Cycle keys that are fully loaded
         self.loaded_items = []  # List of (cycle_key, fhr) currently in memory (ordered by load time = LRU)
@@ -727,8 +744,9 @@ class CrossSectionManager:
     #        Keep previous synoptic during handoff until new one is ready.
     # GFS/RRFS: newest cycle only; keep previous during handoff.
     HRRR_HOURLY_CYCLES = 3   # Number of recent hourly cycles to keep
-    GFS_CYCLES = 1            # GFS cycles to keep (+ 1 during handoff)
-    RRFS_CYCLES = 1           # RRFS cycles to keep (+ 1 during handoff)
+    HRRR_SYNOPTIC_CYCLES = 2 # Number of synoptic (48h) cycles to keep
+    GFS_CYCLES = 2            # GFS cycles to keep (evict oldest on 3rd)
+    RRFS_CYCLES = 2           # RRFS cycles to keep (evict oldest on 3rd)
 
     def _get_target_cycles(self) -> list:
         """Return the list of cycles we WANT loaded, in priority order (newest first).
@@ -746,13 +764,12 @@ class CrossSectionManager:
             return self._get_simple_target_cycles()
 
     def _get_hrrr_target_cycles(self) -> list:
-        """HRRR: latest init first, then newest synoptic, then recent hourlies.
+        """HRRR: latest init first, then synoptics, then recent hourlies.
 
         Priority order:
           1. Latest init cycle (whatever it is) — always #1
-          2. Newest synoptic (48h) — if not already the latest init
+          2. Up to HRRR_SYNOPTIC_CYCLES synoptic (48h) cycles
           3. N most recent hourly cycles
-        Only one synoptic cycle is kept — no previous synoptic handoff.
         """
         targets = []
         seen = set()
@@ -764,10 +781,18 @@ class CrossSectionManager:
         targets.append(newest)
         seen.add(newest['cycle_key'])
 
-        # 2. Newest synoptic (if it's not already the latest init)
-        if synoptics and synoptics[0]['cycle_key'] not in seen:
-            targets.append(synoptics[0])
-            seen.add(synoptics[0]['cycle_key'])
+        # 2. Up to HRRR_SYNOPTIC_CYCLES synoptic cycles
+        syn_count = 0
+        for c in synoptics:
+            if c['cycle_key'] not in seen:
+                targets.append(c)
+                seen.add(c['cycle_key'])
+                syn_count += 1
+                if syn_count >= self.HRRR_SYNOPTIC_CYCLES:
+                    break
+            else:
+                # The newest synoptic was already added as latest init
+                syn_count += 1
 
         # 3. Recent hourly cycles (up to N)
         count = 0
@@ -782,8 +807,9 @@ class CrossSectionManager:
         return targets
 
     def _get_simple_target_cycles(self) -> list:
-        """GFS/RRFS: newest cycle only, no handoff."""
-        return [self.available_cycles[0]]
+        """GFS/RRFS: keep up to GFS_CYCLES/RRFS_CYCLES newest cycles."""
+        max_cycles = self.GFS_CYCLES if self.model_name == 'gfs' else self.RRFS_CYCLES
+        return self.available_cycles[:max_cycles]
 
     def get_protected_cycles(self) -> set:
         """Return cycle keys that should never be evicted — matches target cycle strategy."""
@@ -860,8 +886,16 @@ class CrossSectionManager:
                     grib_backend='auto',
                 )
             self.xsect.model = self.model_name.upper()
+            # Add archive cache dirs as fallback for mmap lookups (comma-separated)
+            archive_env = os.environ.get('XSECT_ARCHIVE_DIR', '')
+            for p in archive_env.split(','):
+                p = p.strip()
+                if p:
+                    archive_cache = Path(p) / 'cache' / 'xsect' / self.model_name
+                    if archive_cache.is_dir():
+                        self.xsect.extra_cache_dirs.append(archive_cache)
+                        logger.info(f"Archive cache fallback: {archive_cache}")
             logger.info(f"Cross-section GRIB backend: {self.xsect.grib_backend}")
-            # Climatology/anomaly mode disabled for now
 
     def scan_available_cycles(self):
         """Scan for all available cycles on disk WITHOUT loading data."""
@@ -925,6 +959,140 @@ class CrossSectionManager:
                         'is_synoptic': cycle_hour_int in SYNOPTIC_HOURS,
                         'expected_fhrs': expected_fhrs,
                     })
+
+        # Also scan archive GRIB dirs (XSECT_ARCHIVE_DIR, comma-separated) for archive event cycles
+        archive_env = os.environ.get('XSECT_ARCHIVE_DIR', '')
+        for archive_base in [p.strip() for p in archive_env.split(',') if p.strip()]:
+            archive_model_dir = Path(archive_base) / self.model_name
+            if archive_model_dir.is_dir():
+                existing_keys = {c['cycle_key'] for c in cycles}
+                for date_dir in sorted(archive_model_dir.iterdir(), reverse=True):
+                    if not date_dir.is_dir() or not date_dir.name.isdigit() or len(date_dir.name) != 8:
+                        continue
+                    for hour_dir in sorted(date_dir.iterdir(), reverse=True):
+                        if not hour_dir.is_dir() or not hour_dir.name.endswith('z'):
+                            continue
+                        hour = hour_dir.name.replace('z', '')
+                        if not hour.isdigit():
+                            continue
+                        cycle_key = f"{date_dir.name}_{hour}z"
+                        if cycle_key in existing_keys:
+                            continue
+                        available_fhrs = []
+                        cycle_hour_int = int(hour)
+                        max_fhr = get_max_fhr_for_cycle(self.model_name, cycle_hour_int)
+                        expected_fhrs = get_model_fhr_list(self.model_name, cycle_hour_int)
+                        for fhr in expected_fhrs:
+                            fhr_dir = hour_dir / f"F{fhr:02d}"
+                            if fhr_dir.exists():
+                                has_prs = [f for f in fhr_dir.glob(self._prs_pattern)
+                                           if not f.name.endswith('.partial')]
+                                if has_prs:
+                                    available_fhrs.append(fhr)
+                        if available_fhrs:
+                            init_dt = datetime.strptime(f"{date_dir.name}{hour}", "%Y%m%d%H")
+                            cycles.append({
+                                'cycle_key': cycle_key,
+                                'date': date_dir.name,
+                                'hour': hour,
+                                'path': str(hour_dir),
+                                'available_fhrs': available_fhrs,
+                                'init_dt': init_dt,
+                                'display': f"{self._display_prefix} - {init_dt.strftime('%b %d %HZ')}",
+                                'max_fhr': max_fhr,
+                                'is_synoptic': cycle_hour_int in SYNOPTIC_HOURS,
+                                'expected_fhrs': expected_fhrs,
+                            })
+
+        # Also scan archive mmap cache dirs for events that have no GRIBs left (already converted)
+        archive_env = os.environ.get('XSECT_ARCHIVE_DIR', '')
+        for archive_base in [p.strip() for p in archive_env.split(',') if p.strip()]:
+            archive_cache_dir = Path(archive_base) / 'cache' / 'xsect' / self.model_name
+            if not archive_cache_dir.is_dir():
+                continue
+            existing_keys = {c['cycle_key'] for c in cycles}
+            # Group FHR dirs by cycle key
+            import re
+            cache_cycle_fhrs = {}
+            for entry in archive_cache_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                m = re.match(r'(\d{8})_(\d{2})z_F(\d+)_', entry.name)
+                if m:
+                    ck = f"{m.group(1)}_{m.group(2)}z"
+                    fhr = int(m.group(3))
+                    cache_cycle_fhrs.setdefault(ck, []).append(fhr)
+            for ck, fhrs in cache_cycle_fhrs.items():
+                if ck in existing_keys:
+                    continue
+                date_str, hour_str = ck.split('_')
+                hour = hour_str.replace('z', '')
+                cycle_hour_int = int(hour)
+                max_fhr = get_max_fhr_for_cycle(self.model_name, cycle_hour_int)
+                expected_fhrs = get_model_fhr_list(self.model_name, cycle_hour_int)
+                init_dt = datetime.strptime(f"{date_str}{hour}", "%Y%m%d%H")
+                cycles.append({
+                    'cycle_key': ck,
+                    'date': date_str,
+                    'hour': hour,
+                    'path': str(archive_cache_dir),
+                    'available_fhrs': sorted(fhrs),
+                    'init_dt': init_dt,
+                    'display': f"{self._display_prefix} - {init_dt.strftime('%b %d %HZ')}",
+                    'max_fhr': max_fhr,
+                    'is_synoptic': cycle_hour_int in SYNOPTIC_HOURS,
+                    'expected_fhrs': expected_fhrs,
+                })
+                existing_keys.add(ck)
+
+        # Also scan local NVMe mmap cache for operational cycles with cleaned-up GRIBs
+        local_cache_dir = Path(self.CACHE_BASE) / self.model_name
+        if local_cache_dir.is_dir():
+            import re
+            cache_cycle_fhrs = {}
+            for entry in local_cache_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                m = re.match(r'(\d{8})_(\d{2})z_F(\d+)_', entry.name)
+                if m and (entry / '_complete').exists():
+                    ck = f"{m.group(1)}_{m.group(2)}z"
+                    fhr = int(m.group(3))
+                    cache_cycle_fhrs.setdefault(ck, []).append(fhr)
+            existing_keys = {c['cycle_key'] for c in cycles}
+            for ck, fhrs in cache_cycle_fhrs.items():
+                if ck in existing_keys:
+                    # Merge mmap-cached FHRs into existing cycle entry
+                    for c in cycles:
+                        if c['cycle_key'] == ck:
+                            c['available_fhrs'] = sorted(set(c['available_fhrs']) | set(fhrs))
+                            break
+                else:
+                    # New cycle only in local mmap cache
+                    date_str, hour_str = ck.split('_')
+                    hour = hour_str.replace('z', '')
+                    cycle_hour_int = int(hour)
+                    max_fhr = get_max_fhr_for_cycle(self.model_name, cycle_hour_int)
+                    expected_fhrs = get_model_fhr_list(self.model_name, cycle_hour_int)
+                    init_dt = datetime.strptime(f"{date_str}{hour}", "%Y%m%d%H")
+                    cycles.append({
+                        'cycle_key': ck,
+                        'date': date_str,
+                        'hour': hour,
+                        'path': str(self.base_dir / date_str / f"{hour}z"),
+                        'available_fhrs': sorted(fhrs),
+                        'init_dt': init_dt,
+                        'display': f"{self._display_prefix} - {init_dt.strftime('%b %d %HZ')}",
+                        'max_fhr': max_fhr,
+                        'is_synoptic': cycle_hour_int in SYNOPTIC_HOURS,
+                        'expected_fhrs': expected_fhrs,
+                    })
+                    existing_keys.add(ck)
+
+        # Sort by init_dt descending so newest cycles are always first,
+        # regardless of whether they came from GRIB scan, archive, or NVMe mmap scan.
+        # This ensures _get_hrrr_target_cycles picks the actual newest init and
+        # recent synoptic cycles instead of old archive events.
+        cycles.sort(key=lambda c: c['init_dt'], reverse=True)
 
         self.available_cycles = cycles  # Atomic swap — no empty window
         return self.available_cycles
@@ -1014,13 +1182,29 @@ class CrossSectionManager:
         cached_items = []
         uncached_items = []
         for cycle, fhr in interleaved:
+            found_cache = False
             prs_files = list((Path(cycle['path']) / f"F{fhr:02d}").glob(self._prs_pattern))
             if prs_files:
                 stem = self.xsect._get_cache_stem(str(prs_files[0]))
                 if stem and (cache_dir / stem).is_dir():
-                    cached_items.append((cycle, fhr))
-                else:
-                    uncached_items.append((cycle, fhr))
+                    found_cache = True
+            if not found_cache:
+                # Check local NVMe cache and archive cache for mmap-only items
+                synthetic = self._find_cache_grib_path(cycle, fhr)
+                if synthetic:
+                    stem = self.xsect._get_cache_stem(synthetic)
+                    if stem:
+                        # Check local cache
+                        if (cache_dir / stem).is_dir():
+                            found_cache = True
+                        else:
+                            # Check extra_cache_dirs (archive SSDs)
+                            for extra in getattr(self.xsect, 'extra_cache_dirs', []):
+                                if (Path(extra) / stem).is_dir():
+                                    found_cache = True
+                                    break
+            if found_cache:
+                cached_items.append((cycle, fhr))
             else:
                 uncached_items.append((cycle, fhr))
 
@@ -1049,11 +1233,18 @@ class CrossSectionManager:
                     self._evict_if_needed()
                     engine_key = self._get_engine_key(ck, fhr)
 
-                prs_files = list((Path(c['path']) / f"F{fhr:02d}").glob(self._prs_pattern))
+                fhr_dir = Path(c['path']) / f"F{fhr:02d}"
+                prs_files = list(fhr_dir.glob(self._prs_pattern))
+                if not prs_files:
+                    # No GRIB — try mmap cache (local NVMe or archive SSD)
+                    synthetic = self._find_cache_grib_path(c, fhr)
+                    if synthetic:
+                        prs_files = [Path(synthetic)]
                 if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
                     with self._lock:
                         if (ck, fhr) not in self.loaded_items:
                             self.loaded_items.append((ck, fhr))
+                    self._cleanup_grib_dir(fhr_dir)
                     return ck, fhr, True
                 return ck, fhr, False
             return _load_one
@@ -1090,30 +1281,54 @@ class CrossSectionManager:
 
         # Phase 2: Convert uncached items from GRIB (ThreadPool — avoids WSL2 folio contention)
         if uncached_items and not cancelled:
-            logger.info(f"  Phase 2: Converting {len(uncached_items)} FHRs from GRIB ({self.GRIB_WORKERS} workers)...")
-            with ThreadPoolExecutor(max_workers=self.GRIB_WORKERS) as pool:
-                futures = {}
-                for cycle, fhr in uncached_items:
-                    loader = _make_loader(cycle)
-                    futures[pool.submit(loader, fhr)] = (cycle['cycle_key'], fhr)
+            global _eccodes_warmed
+            # Warm up eccodes with a single-threaded conversion first to avoid
+            # definition parser init race on cold start
+            if not _eccodes_warmed and self.GRIB_WORKERS > 1:
+                with _eccodes_warm_lock:
+                    if not _eccodes_warmed:
+                        cycle0, fhr0 = uncached_items[0]
+                        loader = _make_loader(cycle0)
+                        logger.info(f"  eccodes warm-up: converting {cycle0['cycle_key']} F{fhr0:02d} single-threaded...")
+                        try:
+                            ck, fhr_r, ok = loader(fhr0)
+                            done[0] += 1
+                            if ok:
+                                logger.info(f"  Loaded {ck} F{fhr_r:02d} (GRIB, warm-up)")
+                                progress_update(op_id, done[0], total, f"Loaded {ck} F{fhr_r:02d} (warm-up)")
+                        except Exception as e:
+                            done[0] += 1
+                            logger.warning(f"  Warm-up failed: {e}")
+                        _eccodes_warmed = True
+                        uncached_items = uncached_items[1:]
+                        if not uncached_items:
+                            pass  # fall through, nothing left
 
-                for future in as_completed(futures):
-                    if is_cancelled(op_id):
-                        for f in futures:
-                            f.cancel()
-                        cancelled = True
-                        break
-                    try:
-                        ck, fhr, ok = future.result()
-                        done[0] += 1
-                        if ok:
-                            logger.info(f"  Loaded {ck} F{fhr:02d} (GRIB)")
-                            progress_update(op_id, done[0], total, f"Loaded {ck} F{fhr:02d} (GRIB)")
-                        else:
-                            progress_update(op_id, done[0], total, f"Failed {ck} F{fhr:02d}")
-                    except Exception as e:
-                        done[0] += 1
-                        logger.warning(f"  Failed to load FHR: {e}")
+            if uncached_items and not cancelled:
+                logger.info(f"  Phase 2: Converting {len(uncached_items)} FHRs from GRIB ({self.GRIB_WORKERS} workers)...")
+                with ThreadPoolExecutor(max_workers=self.GRIB_WORKERS) as pool:
+                    futures = {}
+                    for cycle, fhr in uncached_items:
+                        loader = _make_loader(cycle)
+                        futures[pool.submit(loader, fhr)] = (cycle['cycle_key'], fhr)
+
+                    for future in as_completed(futures):
+                        if is_cancelled(op_id):
+                            for f in futures:
+                                f.cancel()
+                            cancelled = True
+                            break
+                        try:
+                            ck, fhr, ok = future.result()
+                            done[0] += 1
+                            if ok:
+                                logger.info(f"  Loaded {ck} F{fhr:02d} (GRIB)")
+                                progress_update(op_id, done[0], total, f"Loaded {ck} F{fhr:02d} (GRIB)")
+                            else:
+                                progress_update(op_id, done[0], total, f"Failed {ck} F{fhr:02d}")
+                        except Exception as e:
+                            done[0] += 1
+                            logger.warning(f"  Failed to load FHR: {e}")
 
         mem_mb = self.xsect.get_memory_usage()
         if cancelled:
@@ -1213,11 +1428,13 @@ class CrossSectionManager:
                     self._evict_if_needed()
                     engine_key = self._get_engine_key(ck, fhr)
 
-                prs_files = list((Path(c['path']) / f"F{fhr:02d}").glob(self._prs_pattern))
+                fhr_dir = Path(c['path']) / f"F{fhr:02d}"
+                prs_files = list(fhr_dir.glob(self._prs_pattern))
                 if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
                     with self._lock:
                         if (ck, fhr) not in self.loaded_items:
                             self.loaded_items.append((ck, fhr))
+                    self._cleanup_grib_dir(fhr_dir)
                     return fhr, True
                 return fhr, False
             return _load_one
@@ -1251,20 +1468,38 @@ class CrossSectionManager:
         # Phase 2: uncached GRIB conversion (slow)
         uncached_work = [(c, ck, fhr) for c, ck, fhr, is_c in all_work if not is_c]
         if uncached_work:
-            with ThreadPoolExecutor(max_workers=self.GRIB_WORKERS) as pool:
-                futures = {}
-                for c, ck, fhr in uncached_work:
-                    loader = _make_loader(c, ck)
-                    fut = pool.submit(loader, fhr)
-                    futures[fut] = (ck, fhr)
-                for future in as_completed(futures):
-                    ck, fhr = futures[future]
-                    try:
-                        _, ok = future.result()
-                        _on_complete(ck, fhr, ok, False)
-                    except Exception as e:
-                        _on_complete(ck, fhr, False, False)
-                        logger.warning(f"  Auto-load failed: {e}")
+            global _eccodes_warmed
+            # Warm up eccodes single-threaded if this is the first GRIB conversion
+            if not _eccodes_warmed and self.GRIB_WORKERS > 1:
+                with _eccodes_warm_lock:
+                    if not _eccodes_warmed:
+                        c0, ck0, fhr0 = uncached_work[0]
+                        loader = _make_loader(c0, ck0)
+                        logger.info(f"  eccodes warm-up: {ck0} F{fhr0:02d}...")
+                        try:
+                            _, ok = loader(fhr0)
+                            _on_complete(ck0, fhr0, ok, False)
+                        except Exception as e:
+                            _on_complete(ck0, fhr0, False, False)
+                            logger.warning(f"  Warm-up failed: {e}")
+                        _eccodes_warmed = True
+                        uncached_work = uncached_work[1:]
+
+            if uncached_work:
+                with ThreadPoolExecutor(max_workers=self.GRIB_WORKERS) as pool:
+                    futures = {}
+                    for c, ck, fhr in uncached_work:
+                        loader = _make_loader(c, ck)
+                        fut = pool.submit(loader, fhr)
+                        futures[fut] = (ck, fhr)
+                    for future in as_completed(futures):
+                        ck, fhr = futures[future]
+                        try:
+                            _, ok = future.result()
+                            _on_complete(ck, fhr, ok, False)
+                        except Exception as e:
+                            _on_complete(ck, fhr, False, False)
+                            logger.warning(f"  Auto-load failed: {e}")
 
         progress_done(op_id)
 
@@ -1348,11 +1583,18 @@ class CrossSectionManager:
                 self._evict_if_needed()
                 engine_key = self._get_engine_key(cycle_key, fhr)
 
-            prs_files = list((run_path / f"F{fhr:02d}").glob(self._prs_pattern))
+            fhr_dir = run_path / f"F{fhr:02d}"
+            prs_files = list(fhr_dir.glob(self._prs_pattern))
+            if not prs_files:
+                # Try archive mmap cache (no GRIBs, already converted)
+                synthetic = self._find_cache_grib_path(cycle, fhr)
+                if synthetic:
+                    prs_files = [Path(synthetic)]
             if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
                 with self._lock:
                     if (cycle_key, fhr) not in self.loaded_items:
                         self.loaded_items.append((cycle_key, fhr))
+                self._cleanup_grib_dir(fhr_dir)
                 return fhr, True
             return fhr, False
 
@@ -1394,6 +1636,62 @@ class CrossSectionManager:
             'memory_mb': round(mem_mb, 0),
         }
 
+    def _find_cache_grib_path(self, cycle, fhr):
+        """For cycles with mmap cache but no GRIBs, find the cache dir
+        and construct a synthetic GRIB path so load_forecast_hour can locate it.
+        Checks both local NVMe cache and archive cache dirs."""
+        import re
+        prefix = f"{cycle['date']}_{cycle['hour']}z_F{fhr:02d}_"
+
+        # Check local NVMe cache first (operational cycles)
+        local_cache_dir = Path(self.CACHE_BASE) / self.model_name
+        if local_cache_dir.is_dir():
+            for entry in local_cache_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith(prefix):
+                    if (entry / '_complete').exists():
+                        parts = entry.name.split('_', 3)
+                        if len(parts) >= 4:
+                            grib_stem = parts[3]
+                            synthetic = self.base_dir / cycle['date'] / f"{cycle['hour']}z" / f"F{fhr:02d}" / f"{grib_stem}.grib2"
+                            return str(synthetic)
+
+        # Check archive cache dirs
+        archive_env = os.environ.get('XSECT_ARCHIVE_DIR', '')
+        for archive_base in [p.strip() for p in archive_env.split(',') if p.strip()]:
+            cache_dir = Path(archive_base) / 'cache' / 'xsect' / self.model_name
+            if not cache_dir.is_dir():
+                continue
+            for entry in cache_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith(prefix):
+                    if (entry / '_complete').exists():
+                        parts = entry.name.split('_', 3)
+                        if len(parts) >= 4:
+                            grib_stem = parts[3]
+                            synthetic = Path(archive_base) / self.model_name / cycle['date'] / f"{cycle['hour']}z" / f"F{fhr:02d}" / f"{grib_stem}.grib2"
+                            return str(synthetic)
+        return None
+
+    @staticmethod
+    def _cleanup_grib_dir(fhr_dir: Path):
+        """Delete GRIB files from an FHR directory after successful mmap conversion."""
+        if not fhr_dir or not fhr_dir.is_dir():
+            return
+        try:
+            for f in fhr_dir.iterdir():
+                if f.is_file() and f.suffix == '.grib2':
+                    f.unlink()
+            # Remove empty FHR dir, then empty parent dirs
+            if fhr_dir.exists() and not any(fhr_dir.iterdir()):
+                fhr_dir.rmdir()
+                parent = fhr_dir.parent  # HHz dir
+                if parent.exists() and not any(parent.iterdir()):
+                    parent.rmdir()
+                    grandparent = parent.parent  # YYYYMMDD dir
+                    if grandparent.exists() and not any(grandparent.iterdir()):
+                        grandparent.rmdir()
+        except Exception as e:
+            logger.debug(f"GRIB cleanup for {fhr_dir}: {e}")
+
     def load_forecast_hour(self, cycle_key: str, fhr: int) -> dict:
         """Load a specific forecast hour into memory."""
         from datetime import datetime, timedelta
@@ -1418,7 +1716,13 @@ class CrossSectionManager:
             fhr_dir = run_path / f"F{fhr:02d}"
             prs_files = list(fhr_dir.glob(self._prs_pattern))
             if not prs_files:
-                return {'success': False, 'error': f'No GRIB file found for F{fhr:02d}'}
+                # No GRIB — try to find existing mmap cache (archive events on SSD)
+                # Construct a synthetic GRIB path that matches the cache stem convention
+                synthetic_grib = self._find_cache_grib_path(cycle, fhr)
+                if synthetic_grib:
+                    prs_files = [Path(synthetic_grib)]
+                else:
+                    return {'success': False, 'error': f'No GRIB file found for F{fhr:02d}'}
 
             self._evict_if_needed()
             engine_key = self._get_engine_key(cycle_key, fhr)
@@ -1441,6 +1745,7 @@ class CrossSectionManager:
                 if (cycle_key, fhr) not in self.loaded_items:
                     self.loaded_items.append((cycle_key, fhr))
                 self.current_cycle = cycle_key
+            self._cleanup_grib_dir(fhr_dir)
             mem_mb = self.xsect.get_memory_usage()
             logger.info(f"Loaded {cycle_key} F{fhr:02d} in {load_time:.1f}s (Total: {mem_mb:.0f} MB)")
             progress_done(op_id)
@@ -3207,21 +3512,31 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const data = await res.json();
                 cycles = data.cycles || [];
 
-                buildCycleDropdown(cycles, false);
+                const hadSelection = !!currentCycle;
+                buildCycleDropdown(cycles, hadSelection);
 
                 if (cycles.length === 0) return;
 
-                currentCycle = cycles[0].key;
+                // Only auto-select latest if no prior selection was preserved
+                if (!hadSelection) {
+                    currentCycle = cycles[0].key;
+                }
 
                 // Check what's already loaded, then render chips
                 await refreshLoadedStatus();
 
-                // If first cycle has loaded FHRs, auto-select first one
-                if (selectedFhrs.length > 0) {
+                // Update FHR chips for current cycle
+                const curCycleData = cycles.find(c => c.key === currentCycle);
+                if (curCycleData) {
+                    renderFhrChips(curCycleData.fhrs);
+                } else {
+                    renderFhrChips(cycles[0].fhrs);
+                }
+
+                if (selectedFhrs.length > 0 && !activeFhr) {
                     activeFhr = selectedFhrs[0];
                     document.getElementById('active-fhr').textContent = `F${String(activeFhr).padStart(2,'0')}`;
                 }
-                renderFhrChips(cycles[0].fhrs);
             } catch (err) {
                 console.error('Failed to load cycles:', err);
             }
@@ -4171,8 +4486,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             try {
                 const res = await fetch(url);
                 if (!res.ok) {
-                    const err = await res.json();
-                    alert(err.error || 'GIF generation failed');
+                    try {
+                        const err = await res.json();
+                        alert(err.error || 'GIF generation failed');
+                    } catch(e) {
+                        alert('GIF generation failed (server error)');
+                    }
                     return;
                 }
                 const blob = await res.blob();
@@ -4466,7 +4785,7 @@ def api_status():
     mgr = get_manager_from_request() or data_manager
     return jsonify(mgr.get_loaded_status())
 
-AUTO_UPDATE_STATUS_FILE = '/tmp/auto_update_status.json'
+AUTO_UPDATE_STATUS_FILE = os.path.join(tempfile.gettempdir(), 'auto_update_status.json')
 
 def _read_auto_update_status():
     """Read auto-update status file written by auto_update.py. Returns dict or None."""
@@ -4740,22 +5059,46 @@ def api_xsect_gif():
     if len(loaded_fhrs) < 2:
         return jsonify({'error': f'Need at least 2 loaded FHRs for GIF (have {len(loaded_fhrs)})'}), 400
 
-    # Lock terrain to first FHR so elevation doesn't jitter between frames
-    terrain_data = mgr.get_terrain_data(start, end, cycle_key, loaded_fhrs[0], style)
+    # Try to use prerendered frames from FRAME_CACHE first
+    model_name = request.args.get('model', 'hrrr').lower()
+    cached_frames = []
+    uncached_fhrs = []
+    for fhr in loaded_fhrs:
+        ck = frame_cache_key(model_name, cycle_key, fhr, style, start, end, y_axis, vscale, y_top, dist_units, gif_temp_cmap, gif_anomaly)
+        png = frame_cache_get(ck)
+        if png:
+            cached_frames.append((fhr, png))
+        else:
+            uncached_fhrs.append(fhr)
 
-    # GIF holds the semaphore for its entire render sequence (up to 19 frames)
-    sem_timeout = 90
-    acquired = RENDER_SEMAPHORE.acquire(timeout=sem_timeout)
-    if not acquired:
-        return jsonify({'error': 'Server busy, try again in a moment'}), 503
-    try:
+    # If all frames are prerendered, skip matplotlib entirely
+    if not uncached_fhrs:
         frames = []
-        for fhr in loaded_fhrs:
-            buf = mgr.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, terrain_data=terrain_data, temp_cmap=gif_temp_cmap, anomaly=gif_anomaly)
-            if buf is not None:
-                frames.append(imageio.imread(buf))
-    finally:
-        RENDER_SEMAPHORE.release()
+        for fhr, png in sorted(cached_frames, key=lambda x: x[0]):
+            frames.append(imageio.imread(io.BytesIO(png)))
+    else:
+        # Lock terrain to first FHR so elevation doesn't jitter between frames
+        terrain_data = mgr.get_terrain_data(start, end, cycle_key, loaded_fhrs[0], style)
+
+        # GIF holds the semaphore for its entire render sequence
+        sem_timeout = 90
+        acquired = RENDER_SEMAPHORE.acquire(timeout=sem_timeout)
+        if not acquired:
+            return jsonify({'error': 'Server busy, try again in a moment'}), 503
+        try:
+            frames = []
+            for fhr in loaded_fhrs:
+                # Check cache first, render only if needed
+                ck = frame_cache_key(model_name, cycle_key, fhr, style, start, end, y_axis, vscale, y_top, dist_units, gif_temp_cmap, gif_anomaly)
+                png = frame_cache_get(ck)
+                if png:
+                    frames.append(imageio.imread(io.BytesIO(png)))
+                else:
+                    buf = mgr.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, terrain_data=terrain_data, temp_cmap=gif_temp_cmap, anomaly=gif_anomaly)
+                    if buf is not None:
+                        frames.append(imageio.imread(buf))
+        finally:
+            RENDER_SEMAPHORE.release()
 
     if len(frames) < 2:
         return jsonify({'error': 'Failed to generate enough frames'}), 500

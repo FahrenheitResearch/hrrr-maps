@@ -582,6 +582,9 @@ class InteractiveCrossSection:
         self._nat_resolver = nat_resolver or self._default_nat_resolver
         self.set_grib_backend(grib_backend)
 
+        # Extra cache dirs to check as fallback (e.g. archive cache on external drive)
+        self.extra_cache_dirs: List[Path] = []
+
         # Climatology for anomaly mode
         self.climatology_dir = None  # Path to climo NPZ directory
         self._climo_cache: Dict[str, ClimatologyData] = {}  # "MM_HHz_FNN" -> data
@@ -627,11 +630,26 @@ class InteractiveCrossSection:
             return grib_path.stem
 
     def _get_mmap_cache_dir(self, grib_file: str) -> Optional[Path]:
-        """Get mmap cache directory path for a GRIB file."""
+        """Get mmap cache directory path for a GRIB file.
+
+        Checks primary cache_dir first, then extra_cache_dirs as fallback
+        (e.g. archive cache on external drive). New caches are always written
+        to the primary cache_dir.
+        """
         stem = self._get_cache_stem(grib_file)
         if stem is None:
             return None
-        return self.cache_dir / stem
+        primary = self.cache_dir / stem
+        # If it already exists in primary, use it
+        if primary.is_dir():
+            return primary
+        # Check fallback dirs for existing cache
+        for extra_dir in self.extra_cache_dirs:
+            candidate = extra_dir / stem
+            if candidate.is_dir() and (candidate / '_complete').exists():
+                return candidate
+        # Not found anywhere — return primary so new cache gets written there
+        return primary
 
     def _get_legacy_cache_path(self, grib_file: str) -> Optional[Path]:
         """Get legacy .npz cache path for a GRIB file (migration support)."""
@@ -3204,7 +3222,7 @@ class InteractiveCrossSection:
             pass  # Skip inset if cartopy fails
 
         # Add credit
-        fig.text(0.5, 0.005, 'Produced by drewsny  |  Contributors: @jasonbweather, justincat66, Sequoiagrove, California Wildfire Tracking & others',
+        fig.text(0.5, 0.005, 'wxsection.com  |  Contributors: @jasonbweather, justincat66, Sequoiagrove, California Wildfire Tracking & others',
                  ha='center', va='bottom', fontsize=7, color='#888888',
                  transform=fig.transFigure, style='italic', fontweight='bold')
 

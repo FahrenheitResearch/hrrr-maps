@@ -1,37 +1,77 @@
-# start_windows.ps1 - Start wxsection dashboard on native Windows
-#
-# Usage:
-#   .\start_windows.ps1                    # Dashboard only (default)
-#   .\start_windows.ps1 -WithAutoUpdate    # Dashboard + auto-update
+# start_windows.ps1 — wxsection.com Windows startup script
+# Usage: cd C:\Users\drew\hrrr-maps; .\start_windows.ps1
 
-param(
-    [switch]$WithAutoUpdate
-)
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
+
+Write-Host "=== wxsection.com (Windows) ===" -ForegroundColor Cyan
 
 # --- Environment ---
 $env:XSECT_GRIB_BACKEND = "auto"
 $env:WXSECTION_KEY = "cwtc"
+$env:XSECT_CACHE_DIR = "C:\Users\drew\hrrr-maps\cache\xsect"
+$env:XSECT_OUTPUTS_DIR = "C:\Users\drew\hrrr-maps\outputs"
+$env:XSECT_ARCHIVE_DIR = "E:\hrrr-archive"
 
-# Cache dir defaults to ./cache/xsect (relative to repo root)
-# Override with $env:XSECT_CACHE_DIR if you want a different location
-if (-not $env:XSECT_CACHE_DIR) {
-    $env:XSECT_CACHE_DIR = Join-Path $PSScriptRoot "cache" "xsect"
+$PYTHON = "C:\Users\drew\miniforge3\envs\wxsection\python.exe"
+$PORT = 5565
+
+# --- Ensure directories exist ---
+New-Item -ItemType Directory -Force -Path $env:XSECT_CACHE_DIR | Out-Null
+New-Item -ItemType Directory -Force -Path $env:XSECT_OUTPUTS_DIR | Out-Null
+New-Item -ItemType Directory -Force -Path $env:XSECT_ARCHIVE_DIR | Out-Null
+
+# --- Stop existing processes ---
+Write-Host "Stopping existing processes..."
+Get-Process python -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -eq $PYTHON
+} | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+
+# --- Start auto-update ---
+Write-Host "Starting auto-update (HRRR+GFS+RRFS)..."
+$autoUpdate = Start-Process -FilePath $PYTHON -ArgumentList @(
+    "-u", "tools\auto_update.py",
+    "--interval", "2",
+    "--models", "hrrr,gfs,rrfs",
+    "--hrrr-slots", "3",
+    "--gfs-slots", "2",
+    "--rrfs-slots", "1"
+) -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\wxsection_auto_update.log" -RedirectStandardError "$env:TEMP\wxsection_auto_update_err.log"
+Write-Host "  Auto-update PID: $($autoUpdate.Id)"
+
+# --- Start dashboard ---
+Write-Host "Starting dashboard on port $PORT..."
+$dashboard = Start-Process -FilePath $PYTHON -ArgumentList @(
+    "-u", "tools\unified_dashboard.py",
+    "--port", "$PORT",
+    "--models", "hrrr,gfs,rrfs",
+    "--grib-workers", "4"
+) -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\wxsection_dashboard.log" -RedirectStandardError "$env:TEMP\wxsection_dashboard_err.log"
+Write-Host "  Dashboard PID: $($dashboard.Id)"
+
+Start-Sleep -Seconds 5
+
+# --- Status ---
+Write-Host ""
+Write-Host "=== Status ===" -ForegroundColor Green
+Write-Host "Dashboard:   http://localhost:$PORT"
+Write-Host "Auto-update: PID $($autoUpdate.Id)"
+Write-Host ""
+Write-Host "Storage layout:"
+Write-Host "  NVMe cache:    $env:XSECT_CACHE_DIR"
+Write-Host "  GRIB outputs:  $env:XSECT_OUTPUTS_DIR"
+Write-Host "  Archive GRIBs: $env:XSECT_ARCHIVE_DIR"
+Write-Host ""
+Write-Host "Logs:"
+Write-Host "  Dashboard:   $env:TEMP\wxsection_dashboard.log"
+Write-Host "  Auto-update: $env:TEMP\wxsection_auto_update.log"
+Write-Host ""
+
+# Quick health check
+try {
+    $response = Invoke-RestMethod -Uri "http://localhost:$PORT/api/status" -TimeoutSec 10
+    Write-Host "Dashboard: RESPONDING" -ForegroundColor Green
+} catch {
+    Write-Host "Dashboard: starting up (check log in a few seconds)" -ForegroundColor Yellow
 }
-
-# Status file defaults to %TEMP%\auto_update_status.json
-# (auto_update.py and dashboard agree on this automatically via tempfile)
-
-Write-Host "=== wxsection.com - Windows Startup ===" -ForegroundColor Cyan
-Write-Host "Cache dir:    $env:XSECT_CACHE_DIR"
-Write-Host "GRIB backend: $env:XSECT_GRIB_BACKEND"
-
-# --- Auto-update (optional) ---
-if ($WithAutoUpdate) {
-    Write-Host "`nStarting auto-update in background..." -ForegroundColor Yellow
-    Start-Process python -ArgumentList "tools/auto_update.py", "--interval", "2", "--models", "hrrr,gfs,rrfs" -NoNewWindow
-    Start-Sleep -Seconds 2
-}
-
-# --- Dashboard ---
-Write-Host "`nStarting dashboard on port 5561..." -ForegroundColor Green
-python tools/unified_dashboard.py --port 5561 --models hrrr,gfs,rrfs

@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 import signal
@@ -40,8 +41,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 running = True
-OUTPUTS_BASE = Path("outputs")
-STATUS_FILE = Path("/tmp/auto_update_status.json")
+OUTPUTS_BASE = Path(os.environ.get('XSECT_OUTPUTS_DIR', 'outputs'))
+import tempfile
+STATUS_FILE = Path(tempfile.gettempdir()) / "auto_update_status.json"
 
 SYNOPTIC_HOURS = {0, 6, 12, 18}
 
@@ -278,8 +280,10 @@ def download_single_fhr(model, date_str, hour, fhr):
     )
 
 
-DISK_LIMIT_GB = 500
+DISK_LIMIT_GB = int(os.environ.get('XSECT_DISK_LIMIT_GB', '100'))
 DISK_META_FILE = Path(__file__).parent.parent / 'data' / 'disk_meta.json'
+# Max date folders to keep per model (e.g. 2 means keep today + yesterday)
+MAX_DATE_FOLDERS = int(os.environ.get('XSECT_MAX_DATE_FOLDERS', '2'))
 
 def get_disk_usage_gb(model='hrrr'):
     """Get total disk usage of a model's data directory in GB."""
@@ -357,6 +361,30 @@ def cleanup_disk_if_needed(model='hrrr'):
             logger.warning(f"Evict failed for {cycle_key}: {e}")
 
     save_disk_meta(meta)
+
+
+def cleanup_old_date_folders(model='hrrr'):
+    """Delete date folders older than MAX_DATE_FOLDERS most recent.
+
+    Simple, aggressive cleanup: if outputs/hrrr/ has 20260205/, 20260206/,
+    20260207/, 20260208/ and MAX_DATE_FOLDERS=2, deletes 20260205/ and 20260206/.
+    """
+    base_dir = get_base_dir(model)
+    if not base_dir.exists():
+        return
+    date_dirs = sorted(
+        [d for d in base_dir.iterdir() if d.is_dir() and d.name.isdigit()],
+        reverse=True,
+    )
+    if len(date_dirs) <= MAX_DATE_FOLDERS:
+        return
+    for old_dir in date_dirs[MAX_DATE_FOLDERS:]:
+        try:
+            size_gb = sum(f.stat().st_size for f in old_dir.rglob("*") if f.is_file()) / (1024**3)
+            shutil.rmtree(old_dir)
+            logger.info(f"[{model.upper()}] Deleted old date folder {old_dir.name} ({size_gb:.1f} GB)")
+        except Exception as e:
+            logger.warning(f"Failed to delete {old_dir}: {e}")
 
 
 def cleanup_old_extended(model='hrrr'):
@@ -461,8 +489,14 @@ def run_download_pass_concurrent(work_queues, slot_limits, hrrr_max_fhr=None):
     active_by_model = {m: 0 for m in slot_limits}
     in_flight = {}
     total_new = 0
-    hrrr_refresh_interval_sec = 45
-    last_hrrr_refresh = 0.0
+    # Per-model refresh intervals: HRRR every 45s (fast-publishing),
+    # GFS/RRFS every 120s (slower publishing, larger FHR range)
+    model_refresh_interval = {
+        'hrrr': 45,
+        'gfs': 120,
+        'rrfs': 120,
+    }
+    last_model_refresh = {m: 0.0 for m in slot_limits}
 
     # Prefer scheduling HRRR first, then others in name order.
     model_order = sorted(slot_limits.keys(), key=lambda m: (m != 'hrrr', m))
@@ -524,32 +558,36 @@ def run_download_pass_concurrent(work_queues, slot_limits, hrrr_max_fhr=None):
 
     with ThreadPoolExecutor(max_workers=total_workers) as pool:
         while running and (queues or in_flight):
-            # Refresh HRRR queue while other models are still active so newly
-            # published hours can start without waiting for the next outer pass.
-            if (
-                slot_limits.get('hrrr', 0) > 0
-                and 'hrrr' not in queues
-                and active_by_model.get('hrrr', 0) == 0
-            ):
-                now = time.time()
-                if now - last_hrrr_refresh >= hrrr_refresh_interval_sec:
-                    last_hrrr_refresh = now
-                    refreshed = get_pending_work('hrrr', hrrr_max_fhr)
-                    if refreshed:
-                        queues['hrrr'] = deque(refreshed)
-                        logger.info(f"[HRRR] Refreshed pending queue: {len(refreshed)} FHRs")
-                        if 'hrrr' in model_status:
-                            model_status['hrrr']['total'] += len(refreshed)
-                        else:
-                            d0, h0, _ = refreshed[0]
-                            model_status['hrrr'] = {
-                                "cycle": f"{d0}/{h0:02d}z",
-                                "total": len(refreshed),
-                                "done": 0,
-                                "in_flight": [],
-                                "last_ok": None,
-                                "last_fail": None,
-                            }
+            # Refresh queues for any model whose queue is empty and has no
+            # in-flight downloads, so newly published FHRs can start without
+            # waiting for the outer loop (which may be blocked by other models).
+            for refresh_model in model_order:
+                if (
+                    slot_limits.get(refresh_model, 0) > 0
+                    and refresh_model not in queues
+                    and active_by_model.get(refresh_model, 0) == 0
+                ):
+                    now = time.time()
+                    interval = model_refresh_interval.get(refresh_model, 120)
+                    if now - last_model_refresh.get(refresh_model, 0) >= interval:
+                        last_model_refresh[refresh_model] = now
+                        mfhr = hrrr_max_fhr if refresh_model == 'hrrr' else None
+                        refreshed = get_pending_work(refresh_model, mfhr)
+                        if refreshed:
+                            queues[refresh_model] = deque(refreshed)
+                            logger.info(f"[{refresh_model.upper()}] Refreshed pending queue: {len(refreshed)} FHRs")
+                            if refresh_model in model_status:
+                                model_status[refresh_model]['total'] += len(refreshed)
+                            else:
+                                d0, h0, _ = refreshed[0]
+                                model_status[refresh_model] = {
+                                    "cycle": f"{d0}/{h0:02d}z",
+                                    "total": len(refreshed),
+                                    "done": 0,
+                                    "in_flight": [],
+                                    "last_ok": None,
+                                    "last_fail": None,
+                                }
 
             for model_name in model_order:
                 _schedule(model_name, pool)
@@ -584,24 +622,25 @@ def run_download_pass_concurrent(work_queues, slot_limits, hrrr_max_fhr=None):
                     logger.info(f"[{model_name.upper()}] F{fhr:02d} unavailable/failed ({dur:.1f}s)")
                     if model_name in model_status:
                         model_status[model_name]["last_fail"] = f"F{fhr:02d}"
-                    # HRRR fail-fast: if Fxx isn't available, higher FHRs in same cycle
-                    # are generally not available either.
-                    if model_name == 'hrrr' and 'hrrr' in queues:
-                        before = len(queues['hrrr'])
-                        queues['hrrr'] = deque(
+                    # Fail-fast: if Fxx isn't available, higher FHRs in same cycle
+                    # are generally not available either. Prune them and let the
+                    # refresh loop retry later when they're published.
+                    if model_name in queues:
+                        before = len(queues[model_name])
+                        queues[model_name] = deque(
                             (d, h, f)
-                            for d, h, f in queues['hrrr']
+                            for d, h, f in queues[model_name]
                             if not (d == date_str and h == hour and f > fhr)
                         )
-                        pruned = before - len(queues['hrrr'])
+                        pruned = before - len(queues[model_name])
                         if pruned > 0:
                             logger.info(
-                                f"[HRRR] Pruned {pruned} higher FHRs after unavailable "
+                                f"[{model_name.upper()}] Pruned {pruned} higher FHRs after unavailable "
                                 f"{date_str}/{hour:02d}z F{fhr:02d}"
                             )
-                            if 'hrrr' in model_status:
-                                model_status['hrrr']['total'] -= pruned
-                        _drop_if_empty('hrrr')
+                            if model_name in model_status:
+                                model_status[model_name]['total'] -= pruned
+                        _drop_if_empty(model_name)
 
             _update_in_flight()
             _flush_status()
@@ -698,6 +737,7 @@ def main():
 
             # Run cleanup after each pass
             for model in models:
+                cleanup_old_date_folders(model)
                 cleanup_disk_if_needed(model)
                 cleanup_old_extended(model)
 
