@@ -10,7 +10,8 @@ venv/
 .venv/
 
 # Data files (GRIB, NetCDF, cache)
-data/
+/data/
+output/
 outputs/
 cache/
 grib_files/
@@ -18,6 +19,8 @@ grib_files/
 *.idx
 *.nc
 *.npz
+*.npy
+*.partial
 
 # Images (screenshots, test outputs)
 *.png
@@ -42,6 +45,17 @@ grib_files/
 
 # Agent context (local only, not committed)
 AGENT_CONTEXT.md
+
+# Research / large generated content
+research/
+
+# Temp/scratch files
+_*.py
+_*.b64
+temp_*.py
+temp_*.ps1
+rebuild_progress.json
+NUL
 
 # OS
 .DS_Store

@@ -70,6 +70,28 @@ class ForecastHourData:
     # Source GRIB path (for lazy smoke backfill)
     grib_file: str = None
 
+    # Mmap cache directory (for lazy surface overlay field loading)
+    _cache_dir: str = None
+
+    def load_surface_field(self, name: str):
+        """Load a surface overlay field from mmap cache on demand.
+
+        Called by the map overlay renderer when it needs t2m, refc, etc.
+        Returns the array or None if not available.
+        """
+        # Already loaded?
+        val = getattr(self, name, None)
+        if val is not None:
+            return val
+        if not self._cache_dir:
+            return None
+        npy_path = Path(self._cache_dir) / f'{name}.npy'
+        if not npy_path.exists():
+            return None
+        arr = np.load(npy_path, mmap_mode='r')
+        setattr(self, name, arr)
+        return arr
+
     def memory_usage_mb(self) -> float:
         """Estimate memory usage in MB.
 
@@ -306,22 +328,39 @@ def _load_hour_process(
                 except Exception:
                     pass
 
-            try:
-                ds_sp = cfgrib.open_dataset(
-                    resolved_sfc,
-                    filter_by_keys={'typeOfLevel': 'surface', 'shortName': 'sp'},
-                    backend_kwargs={'indexpath': ''},
-                )
-                if ds_sp and len(ds_sp.data_vars) > 0:
-                    sp_data = ds_sp[list(ds_sp.data_vars)[0]].values
-                    while sp_data.ndim > 2:
-                        sp_data = sp_data[0]
-                    if np.isfinite(sp_data).any() and np.nanmax(sp_data) > 2000:
-                        sp_data = sp_data / 100.0
-                    data.surface_pressure = sp_data
-                ds_sp.close()
-            except Exception:
-                pass
+            # Extract surface fields from wrfsfc
+            _cfgrib_sfc = [
+                ({'typeOfLevel': 'surface', 'shortName': 'sp'}, 'surface_pressure'),
+                ({'typeOfLevel': 'heightAboveGround', 'shortName': '2t'}, 't2m'),
+                ({'typeOfLevel': 'heightAboveGround', 'shortName': '2d'}, 'd2m'),
+                ({'typeOfLevel': 'heightAboveGround', 'shortName': '10u'}, 'u10m'),
+                ({'typeOfLevel': 'heightAboveGround', 'shortName': '10v'}, 'v10m'),
+                ({'typeOfLevel': 'atmosphere', 'shortName': 'refc'}, 'refc'),
+                ({'typeOfLevel': 'surface', 'shortName': 'cape'}, 'cape_sfc'),
+                ({'typeOfLevel': 'surface', 'shortName': 'cin'}, 'cin_sfc'),
+                ({'typeOfLevel': 'surface', 'shortName': 'gust'}, 'gust'),
+                ({'typeOfLevel': 'surface', 'shortName': 'prate'}, 'prate'),
+                ({'typeOfLevel': 'surface', 'shortName': 'vis'}, 'vis'),
+                ({'typeOfLevel': 'meanSea', 'shortName': 'prmsl'}, 'mslp'),
+            ]
+            for filter_keys, attr_name in _cfgrib_sfc:
+                try:
+                    ds_sfc = cfgrib.open_dataset(
+                        resolved_sfc,
+                        filter_by_keys=filter_keys,
+                        backend_kwargs={'indexpath': ''},
+                    )
+                    if ds_sfc and len(ds_sfc.data_vars) > 0:
+                        arr = ds_sfc[list(ds_sfc.data_vars)[0]].values
+                        while arr.ndim > 2:
+                            arr = arr[0]
+                        if attr_name == 'surface_pressure':
+                            if np.isfinite(arr).any() and np.nanmax(arr) > 2000:
+                                arr = arr / 100.0
+                        setattr(data, attr_name, arr)
+                    ds_sfc.close()
+                except Exception:
+                    pass
 
             return data
 
@@ -396,6 +435,29 @@ def _load_hour_process(
             if arr is not None:
                 setattr(data, field_name, arr)
 
+        # Map of (shortName, typeOfLevel) -> ForecastHourData attribute name
+        # for all surface fields we want from wrfsfc
+        _SFC_EXTRACT = {
+            ('sp', 'surface'): 'surface_pressure',
+            ('2t', 'heightAboveGround'): 't2m',
+            ('2d', 'heightAboveGround'): 'd2m',
+            ('10u', 'heightAboveGround'): 'u10m',
+            ('10v', 'heightAboveGround'): 'v10m',
+            ('refc', 'atmosphere'): 'refc',
+            ('refc', 'atmosphereSingleLayer'): 'refc',
+            ('refd', 'atmosphere'): 'refc',       # alternate shortName
+            ('refd', 'atmosphereSingleLayer'): 'refc',
+            ('cape', 'surface'): 'cape_sfc',
+            ('cin', 'surface'): 'cin_sfc',
+            ('gust', 'surface'): 'gust',
+            ('prate', 'surface'): 'prate',
+            ('vis', 'surface'): 'vis',
+            ('mslet', 'meanSea'): 'mslp',
+            ('prmsl', 'meanSea'): 'mslp',
+            ('mslma', 'meanSea'): 'mslp',
+        }
+        _found_attrs = set()
+
         with open(resolved_sfc, 'rb') as f:
             while True:
                 msg = eccodes.codes_grib_new_from_file(f)
@@ -404,12 +466,19 @@ def _load_hour_process(
                 try:
                     short_name = eccodes.codes_get(msg, 'shortName')
                     ltype = eccodes.codes_get(msg, 'typeOfLevel')
-                    if short_name == 'sp' and ltype == 'surface':
-                        sp_data = _decode_msg_to_2d(msg).astype(np.float32, copy=False)
-                        if np.isfinite(sp_data).any() and np.nanmax(sp_data) > 2000:
-                            sp_data = sp_data / 100.0
-                        data.surface_pressure = sp_data
-                        break
+                    attr_name = _SFC_EXTRACT.get((short_name, ltype))
+                    if attr_name is None or attr_name in _found_attrs:
+                        continue
+
+                    arr2d = _decode_msg_to_2d(msg).astype(np.float32, copy=False)
+
+                    # Surface pressure: convert Pa -> hPa if needed
+                    if attr_name == 'surface_pressure':
+                        if np.isfinite(arr2d).any() and np.nanmax(arr2d) > 2000:
+                            arr2d = arr2d / 100.0
+
+                    setattr(data, attr_name, arr2d)
+                    _found_attrs.add(attr_name)
                 finally:
                     eccodes.codes_release(msg)
 
@@ -753,6 +822,14 @@ class InteractiveCrossSection:
         'surface_pressure', 'theta', 'temp_c',
         'smoke_hyb', 'smoke_pres_hyb',
     }
+    # Surface overlay fields — saved to mmap cache on disk but NOT loaded into
+    # the cross-section engine's memory map during preload.  The map overlay
+    # renderer loads them on-demand from the .npy files to avoid page-cache
+    # pressure that slows down cross-section rendering.
+    _SURFACE_OVERLAY_FIELDS = {
+        'refc', 't2m', 'd2m', 'u10m', 'v10m', 'mslp',
+        'cape_sfc', 'cin_sfc', 'gust', 'vis', 'prate',
+    }
     # Fields kept at float32 (need precision for derived calculations)
     _FLOAT32_FIELDS = {'geopotential_height'}
     # Coordinate fields kept at float64 (tiny, loaded into RAM)
@@ -784,8 +861,8 @@ class InteractiveCrossSection:
                 if arr is not None:
                     np.save(tmp_dir / f'{field_name}.npy', arr)
 
-            # Save float16 fields
-            for field_name in self._FLOAT16_FIELDS:
+            # Save float16 fields (cross-section 3D + surface overlay 2D)
+            for field_name in (self._FLOAT16_FIELDS | self._SURFACE_OVERLAY_FIELDS):
                 arr = getattr(fhr_data, field_name, None)
                 if arr is not None:
                     # Read from mmap if needed before converting
@@ -841,8 +918,11 @@ class InteractiveCrossSection:
                 lats=lats,
                 lons=lons,
             )
+            # Store cache dir for lazy surface overlay field loading
+            fhr_data._cache_dir = str(cache_dir)
 
-            # Memory-map all field files (no data read, just file handles)
+            # Memory-map cross-section fields only (not surface overlay fields)
+            # Surface overlay fields (t2m, refc, etc.) are lazy-loaded via load_surface_field()
             all_fields = self._FLOAT16_FIELDS | self._FLOAT32_FIELDS
             for field_name in all_fields:
                 npy_path = cache_dir / f'{field_name}.npy'
@@ -1092,10 +1172,32 @@ class InteractiveCrossSection:
                 setattr(fhr_data, field_name, arr)
             step += 1
 
-        cb(11, total_steps, "Reading Surface Pressure...")
+        cb(11, total_steps, "Reading Surface Fields...")
         sp_file = self._sfc_resolver(grib_file)
-        surface_pressure = None
         sp_scanned = 0
+
+        # Map of (shortName, typeOfLevel) -> ForecastHourData attribute
+        _SFC_EXTRACT = {
+            ('sp', 'surface'): 'surface_pressure',
+            ('2t', 'heightAboveGround'): 't2m',
+            ('2d', 'heightAboveGround'): 'd2m',
+            ('10u', 'heightAboveGround'): 'u10m',
+            ('10v', 'heightAboveGround'): 'v10m',
+            ('refc', 'atmosphere'): 'refc',
+            ('refc', 'atmosphereSingleLayer'): 'refc',
+            ('refd', 'atmosphere'): 'refc',
+            ('refd', 'atmosphereSingleLayer'): 'refc',
+            ('cape', 'surface'): 'cape_sfc',
+            ('cin', 'surface'): 'cin_sfc',
+            ('gust', 'surface'): 'gust',
+            ('prate', 'surface'): 'prate',
+            ('vis', 'surface'): 'vis',
+            ('mslet', 'meanSea'): 'mslp',
+            ('prmsl', 'meanSea'): 'mslp',
+            ('mslma', 'meanSea'): 'mslp',
+        }
+        _found_attrs = set()
+
         with open(sp_file, 'rb') as f:
             while True:
                 try:
@@ -1108,17 +1210,20 @@ class InteractiveCrossSection:
                 try:
                     short_name = eccodes.codes_get(msg, 'shortName')
                     ltype = eccodes.codes_get(msg, 'typeOfLevel')
-                    if short_name == 'sp' and ltype == 'surface':
-                        surface_pressure = self._grib_msg_to_2d(msg).astype(np.float32, copy=False)
-                        break
+                    attr_name = _SFC_EXTRACT.get((short_name, ltype))
+                    if attr_name is None or attr_name in _found_attrs:
+                        continue
+
+                    arr2d = self._grib_msg_to_2d(msg).astype(np.float32, copy=False)
+                    if attr_name == 'surface_pressure':
+                        if np.isfinite(arr2d).any() and np.nanmax(arr2d) > 2000:
+                            arr2d = arr2d / 100.0
+                    setattr(fhr_data, attr_name, arr2d)
+                    _found_attrs.add(attr_name)
                 finally:
                     eccodes.codes_release(msg)
 
-        if surface_pressure is not None:
-            if np.isfinite(surface_pressure).any() and np.nanmax(surface_pressure) > 2000:
-                surface_pressure = surface_pressure / 100.0
-            fhr_data.surface_pressure = surface_pressure
-        else:
+        if 'surface_pressure' not in _found_attrs:
             print("  Warning: Could not load surface pressure via eccodes")
 
         print(f"  eccodes core scan: prs_msgs={scanned}, matched={matched}, sfc_msgs={sp_scanned}")
@@ -1192,26 +1297,41 @@ class InteractiveCrossSection:
                     print(f"  Warning: Could not load {grib_key}: {e}")
                 step += 1
 
-            cb(11, total_steps, "Reading Surface Pressure...")
-            try:
-                sp_file = self._sfc_resolver(grib_file)
+            cb(11, total_steps, "Reading Surface Fields...")
+            sp_file = self._sfc_resolver(grib_file)
 
-                ds_sp = cfgrib.open_dataset(
-                    sp_file,
-                    filter_by_keys={'typeOfLevel': 'surface', 'shortName': 'sp'},
-                    backend_kwargs={'indexpath': ''},
-                )
-                if ds_sp and len(ds_sp.data_vars) > 0:
-                    sp_var = list(ds_sp.data_vars)[0]
-                    sp_data = ds_sp[sp_var].values
-                    while sp_data.ndim > 2:
-                        sp_data = sp_data[0]
-                    if sp_data.max() > 2000:
-                        sp_data = sp_data / 100.0
-                    fhr_data.surface_pressure = sp_data
-                ds_sp.close()
-            except Exception as e:
-                print(f"  Warning: Could not load surface pressure: {e}")
+            _cfgrib_sfc = [
+                ({'typeOfLevel': 'surface', 'shortName': 'sp'}, 'surface_pressure'),
+                ({'typeOfLevel': 'heightAboveGround', 'shortName': '2t'}, 't2m'),
+                ({'typeOfLevel': 'heightAboveGround', 'shortName': '2d'}, 'd2m'),
+                ({'typeOfLevel': 'heightAboveGround', 'shortName': '10u'}, 'u10m'),
+                ({'typeOfLevel': 'heightAboveGround', 'shortName': '10v'}, 'v10m'),
+                ({'typeOfLevel': 'atmosphere', 'shortName': 'refc'}, 'refc'),
+                ({'typeOfLevel': 'surface', 'shortName': 'cape'}, 'cape_sfc'),
+                ({'typeOfLevel': 'surface', 'shortName': 'cin'}, 'cin_sfc'),
+                ({'typeOfLevel': 'surface', 'shortName': 'gust'}, 'gust'),
+                ({'typeOfLevel': 'surface', 'shortName': 'prate'}, 'prate'),
+                ({'typeOfLevel': 'surface', 'shortName': 'vis'}, 'vis'),
+                ({'typeOfLevel': 'meanSea', 'shortName': 'prmsl'}, 'mslp'),
+            ]
+            for filter_keys, attr_name in _cfgrib_sfc:
+                try:
+                    ds_sfc = cfgrib.open_dataset(
+                        sp_file,
+                        filter_by_keys=filter_keys,
+                        backend_kwargs={'indexpath': ''},
+                    )
+                    if ds_sfc and len(ds_sfc.data_vars) > 0:
+                        arr = ds_sfc[list(ds_sfc.data_vars)[0]].values
+                        while arr.ndim > 2:
+                            arr = arr[0]
+                        if attr_name == 'surface_pressure':
+                            if np.isfinite(arr).any() and np.nanmax(arr) > 2000:
+                                arr = arr / 100.0
+                        setattr(fhr_data, attr_name, arr)
+                    ds_sfc.close()
+                except Exception:
+                    pass
 
         return fhr_data
 
@@ -1545,26 +1665,40 @@ class InteractiveCrossSection:
                     except Exception:
                         pass  # Silently skip unavailable fields in parallel mode
 
-                # Load surface pressure
-                try:
-                    sp_file = self._sfc_resolver(grib_file)
-
-                    ds_sp = cfgrib.open_dataset(
-                        sp_file,
-                        filter_by_keys={'typeOfLevel': 'surface', 'shortName': 'sp'},
-                        backend_kwargs={'indexpath': ''},
-                    )
-                    if ds_sp and len(ds_sp.data_vars) > 0:
-                        sp_var = list(ds_sp.data_vars)[0]
-                        sp_data = ds_sp[sp_var].values
-                        while sp_data.ndim > 2:
-                            sp_data = sp_data[0]
-                        if sp_data.max() > 2000:
-                            sp_data = sp_data / 100.0
-                        fhr_data.surface_pressure = sp_data
-                    ds_sp.close()
-                except Exception:
-                    pass
+                # Load surface fields from wrfsfc
+                sp_file = self._sfc_resolver(grib_file)
+                _cfgrib_sfc = [
+                    ({'typeOfLevel': 'surface', 'shortName': 'sp'}, 'surface_pressure'),
+                    ({'typeOfLevel': 'heightAboveGround', 'shortName': '2t'}, 't2m'),
+                    ({'typeOfLevel': 'heightAboveGround', 'shortName': '2d'}, 'd2m'),
+                    ({'typeOfLevel': 'heightAboveGround', 'shortName': '10u'}, 'u10m'),
+                    ({'typeOfLevel': 'heightAboveGround', 'shortName': '10v'}, 'v10m'),
+                    ({'typeOfLevel': 'atmosphere', 'shortName': 'refc'}, 'refc'),
+                    ({'typeOfLevel': 'surface', 'shortName': 'cape'}, 'cape_sfc'),
+                    ({'typeOfLevel': 'surface', 'shortName': 'cin'}, 'cin_sfc'),
+                    ({'typeOfLevel': 'surface', 'shortName': 'gust'}, 'gust'),
+                    ({'typeOfLevel': 'surface', 'shortName': 'prate'}, 'prate'),
+                    ({'typeOfLevel': 'surface', 'shortName': 'vis'}, 'vis'),
+                    ({'typeOfLevel': 'meanSea', 'shortName': 'prmsl'}, 'mslp'),
+                ]
+                for filter_keys, attr_name in _cfgrib_sfc:
+                    try:
+                        ds_sfc = cfgrib.open_dataset(
+                            sp_file,
+                            filter_by_keys=filter_keys,
+                            backend_kwargs={'indexpath': ''},
+                        )
+                        if ds_sfc and len(ds_sfc.data_vars) > 0:
+                            arr = ds_sfc[list(ds_sfc.data_vars)[0]].values
+                            while arr.ndim > 2:
+                                arr = arr[0]
+                            if attr_name == 'surface_pressure':
+                                if np.isfinite(arr).any() and np.nanmax(arr) > 2000:
+                                    arr = arr / 100.0
+                            setattr(fhr_data, attr_name, arr)
+                        ds_sfc.close()
+                    except Exception:
+                        pass
 
                 # Pre-compute theta and temp_c
                 if fhr_data.temperature is not None:
@@ -1972,14 +2106,17 @@ class InteractiveCrossSection:
             _, indices = tree.query(tgt_pts, k=1)
 
             def interp_3d(field_3d):
-                result = np.full((n_levels, n_points), np.nan)
+                result = np.full((n_levels, n_points), np.nan, dtype=np.float32)
                 for lev in range(min(field_3d.shape[0], n_levels)):
-                    level_data = _ensure_float32(field_3d[lev])
-                    result[lev, :] = level_data.ravel()[indices]
+                    # Read only the cross-section points from mmap — avoids
+                    # reading entire 2D level (3.8 MB) when we need <1 KB
+                    vals = field_3d[lev].ravel()[indices]
+                    result[lev, :] = vals if vals.dtype == np.float32 else vals.astype(np.float32)
                 return result
 
             def interp_2d(field_2d):
-                return _ensure_float32(field_2d).ravel()[indices]
+                vals = field_2d.ravel()[indices]
+                return vals if vals.dtype == np.float32 else vals.astype(np.float32)
         else:
             # Regular grid - use bilinear interpolation
             lats_1d = lats_grid if lats_grid.ndim == 1 else lats_grid[:, 0]
@@ -2014,7 +2151,7 @@ class InteractiveCrossSection:
                 return f
 
             def interp_3d(field_3d):
-                result = np.full((n_levels, n_points), np.nan)
+                result = np.full((n_levels, n_points), np.nan, dtype=np.float32)
                 for lev in range(min(field_3d.shape[0], n_levels)):
                     level_data = _reorder_field(_ensure_float32(field_3d[lev]))
                     interp = RegularGridInterpolator(
@@ -2065,14 +2202,14 @@ class InteractiveCrossSection:
             path_lats_hires = np.linspace(path_lats[0], path_lats[-1], terrain_res)
             path_lons_hires = np.linspace(path_lons[0], path_lons[-1], terrain_res)
 
-            sp_f32 = _ensure_float32(fhr_data.surface_pressure)
             if lats_grid.ndim == 2:
-                # Curvilinear - use same tree
+                # Curvilinear - use same tree, read only needed points from mmap
                 tgt_pts_hires = np.column_stack([path_lats_hires, path_lons_hires])
                 _, indices_hires = tree.query(tgt_pts_hires, k=1)
-                sp_hires = sp_f32.ravel()[indices_hires]
+                sp_hires = fhr_data.surface_pressure.ravel()[indices_hires].astype(np.float32)
             else:
-                # Regular grid - bilinear interpolation
+                # Regular grid - bilinear interpolation (needs full 2D array, but GFS grid is small)
+                sp_f32 = _ensure_float32(fhr_data.surface_pressure)
                 pts_hires = np.column_stack([path_lats_hires, path_lons_hires])
                 interp_sp = RegularGridInterpolator(
                     (lats_1d, lons_1d), _reorder_field(sp_f32),

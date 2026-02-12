@@ -13,8 +13,15 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+from requests.adapters import HTTPAdapter
+
 from model_config import get_model_registry
 from .io import create_output_structure, get_forecast_hour_dir
+
+# Minimum valid GRIB file size (bytes).  Even the smallest wrfsfc subsets are >1MB.
+# HTML error pages from NOMADS are typically <5KB.
+MIN_GRIB_SIZE = 500_000  # 500KB
 
 logger = logging.getLogger(__name__)
 
@@ -66,18 +73,55 @@ def _apply_source_preference(urls: List[str], source_preference: Optional[List[s
 def download_grib_file(url: str, output_path: Path, timeout: int = 600) -> bool:
     """Download a single GRIB file from URL.
 
-    Downloads to a .partial temp file first, then atomically renames to the
-    final path. This prevents readers from seeing a half-written file.
+    Downloads to a .partial temp file first, validates the response (HTTP status,
+    content type, file size), then atomically renames to the final path.
+    Returns False and cleans up on any validation failure — never writes
+    HTML error pages or truncated files to the final path.
     """
     partial_path = Path(str(output_path) + '.partial')
     try:
-        socket.setdefaulttimeout(timeout)
-        urllib.request.urlretrieve(url, partial_path)
+        resp = requests.get(url, timeout=timeout, stream=True)
+
+        # Reject non-200 responses (rate-limit 429, server error 503, etc.)
+        if resp.status_code != 200:
+            logger.warning(f"HTTP {resp.status_code} from {url}")
+            return False
+
+        # Reject HTML error pages masquerading as GRIB data
+        ct = (resp.headers.get('Content-Type') or '').lower()
+        if 'html' in ct or 'text' in ct:
+            logger.warning(f"Non-binary Content-Type '{ct}' from {url} (likely rate-limit page)")
+            return False
+
+        # Stream to .partial file
+        written = 0
+        with open(partial_path, 'wb') as f:
+            for chunk in resp.iter_content(chunk_size=256 * 1024):
+                f.write(chunk)
+                written += len(chunk)
+
+        # Reject tiny files (HTML error bodies, truncated downloads)
+        if written < MIN_GRIB_SIZE:
+            logger.warning(f"Downloaded file too small ({written} bytes) from {url}")
+            partial_path.unlink(missing_ok=True)
+            return False
+
+        # Sanity: first 4 bytes of a valid GRIB file are 'GRIB'
+        with open(partial_path, 'rb') as f:
+            magic = f.read(4)
+        if magic != b'GRIB':
+            logger.warning(f"File does not start with GRIB magic (got {magic!r}) from {url}")
+            partial_path.unlink(missing_ok=True)
+            return False
+
         partial_path.rename(output_path)
         return True
-    except (urllib.error.URLError, socket.timeout, OSError) as e:
+    except requests.exceptions.RequestException as e:
         logger.debug(f"Failed to download from {url}: {e}")
-        # Clean up partial file on failure
+        partial_path.unlink(missing_ok=True)
+        return False
+    except OSError as e:
+        logger.debug(f"I/O error downloading from {url}: {e}")
         partial_path.unlink(missing_ok=True)
         return False
 
@@ -112,9 +156,15 @@ def download_forecast_hour(
         file_ok = False
 
         if output_path.exists():
-            logger.debug(f"File exists: {filename}")
-            file_ok = True
-            continue
+            # Validate existing file isn't corrupted (0-byte, HTML error page, etc.)
+            fsize = output_path.stat().st_size
+            if fsize < MIN_GRIB_SIZE:
+                logger.warning(f"Existing file {filename} too small ({fsize} bytes) — re-downloading")
+                output_path.unlink()
+            else:
+                logger.debug(f"File exists: {filename}")
+                file_ok = True
+                continue
 
         urls = model_config.get_download_urls(date_str, cycle_hour, file_type, forecast_hour)
         urls = _apply_source_preference(urls, source_preference)
